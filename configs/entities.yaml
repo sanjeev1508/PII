@@ -54,3 +54,31 @@ llm_review:
   min_confidence: 0.50
   model: "gpt-4.1-mini"
   fail_open_on_error: true
+  # Number of candidates per direct OpenAI batch request
+  batch_size: 50
+  # Local skill profile and confidence reference file consumed by the LLM
+  skills_file: "SKILLS.md"
+  reference_file: "outputs/llm/reference_scores.json"
+  # Optional: review only these ambiguous types (empty list = all types)
+  review_entity_types: ["PARTY_NAME", "ADDRESS", "JURISDICTION"]
+  # Safety/performance cap for LLM reviews per document
+  max_reviews_per_document: 250
+
+orchestration:
+  # If detector confidence is above this value, mask directly without LLM.
+  direct_spacy_confidence: 0.90
+
+qdrant:
+  enabled: true
+  # Local Docker Qdrant endpoint
+  url: "http://localhost:6333"
+  collection: "unreported_candidates"
+  # Threshold supports 50 (percent) or 0.5 (normalized)
+  min_confidence_percent: 50
+  # Async OpenAI agent settings for payload acceptance
+  agent_model: "gpt-4.1-mini"
+  agent_batch_size: 40
+  skills_file: "SKILLS.md"
+  reference_file: "outputs/llm/reference_scores.json"
+  timeout_seconds: 8
+  vector_dim: 12

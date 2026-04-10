@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment secrets
+.env
+.env.*
+
+# Model weights & large binary caches
+.doctr/
+doctr_cache/
+*.h5
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Outputs / generated files
+outputs/
+*.zip
+*.pdf
+
+# Temp files
+tmp/
+temp/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Qdrant local data
+qdrant_storage/
+
+# PyInstaller
+*.manifest
+
+# Coverage
+.coverage
+htmlcov/
+
+# MyPy
+.mypy_cache/

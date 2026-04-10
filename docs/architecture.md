@@ -9,18 +9,15 @@ flowchart TD
 
     E -->|score < min_confidence| F[Reject Candidate]
     E -->|score >= confidence_threshold| G[Mask Directly]
-    E -->|min <= score < max| H[LLM/MCP Review]
+    E -->|min <= score < max| H[LLM Batch Review]
 
     H -->|SENSITIVE| G
     H -->|NOT_SENSITIVE| F
     H -->|Review Error + fail_open_on_error=true| G
 
     G --> I[Masking Stage]
-    I -->|MASK_WITH_MCP=true| J[MCP mask_pdf Tool]
-    I -->|fallback| K[Local PyMuPDF Redaction]
-
-    J --> L[Generate Report PDF]
-    K --> L
+    I --> K[Local PyMuPDF Redaction]
+    K --> L[Generate Report PDF]
 
     F --> L
     L --> M[Bundle masked.pdf + report.pdf]
@@ -30,5 +27,5 @@ flowchart TD
 ## Notes
 
 - NLP detection backend: Presidio + spaCy `en_core_web_lg`
-- Borderline candidates are reviewed using OpenAI (direct or via MCP)
-- Report includes direct-threshold and LLM/MCP review outcomes
+- Borderline candidates are reviewed using direct OpenAI batch classification
+- Report includes direct-threshold and LLM review outcomes

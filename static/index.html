@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PII Sanitizer — Redact & Analyze</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Reset & Tokens ─────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d0f14;
+      --surface:   #13161e;
+      --surface2:  #1a1e2a;
+      --surface3:  #222636;
+      --border:    #2a2f45;
+      --border2:   #353b56;
+      --accent:    #6c63ff;
+      --accent2:   #a78bfa;
+      --success:   #22d3a8;
+      --warn:      #f59e0b;
+      --danger:    #f87171;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --muted2:    #94a3b8;
+      --radius:    12px;
+      --radius-sm: 8px;
+      --shadow:    0 4px 24px rgba(0,0,0,.45);
+      --glow:      0 0 20px rgba(108,99,255,.25);
+      --left-w:    320px;
+    }
+
+    html, body { height: 100%; overflow: hidden; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Top Bar ─────────────────────────────────────────── */
+    header {
+      height: 56px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 24px;
+      gap: 14px;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    header .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1rem;
+      letter-spacing: .02em;
+    }
+    header .logo svg { color: var(--accent); }
+    header .badge {
+      font-size: .65rem;
+      font-weight: 600;
+      background: linear-gradient(135deg,var(--accent),var(--accent2));
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 20px;
+      letter-spacing: .06em;
+    }
+    header .spacer { flex: 1; }
+    #status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+      transition: background .3s;
+    }
+    #status-dot.ok  { background: var(--success); box-shadow: 0 0 8px var(--success); }
+    #status-dot.err { background: var(--danger); }
+    #status-label { font-size: .78rem; color: var(--muted2); }
+
+    /* ── Main Layout ─────────────────────────────────────── */
+    .layout {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── Left Sidebar ────────────────────────────────────── */
+    aside {
+      width: var(--left-w);
+      min-width: var(--left-w);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-section {
+      padding: 18px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sidebar-section h3 {
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: .1em;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    /* Upload Zone */
+    #drop-zone {
+      border: 2px dashed var(--border2);
+      border-radius: var(--radius);
+      padding: 28px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .25s, background .25s, box-shadow .25s;
+      position: relative;
+    }
+    #drop-zone:hover, #drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(108,99,255,.06);
+      box-shadow: var(--glow);
+    }
+    #drop-zone .icon {
+      font-size: 2rem;
+      margin-bottom: 8px;
+      display: block;
+    }
+    #drop-zone .hint {
+      font-size: .8rem;
+      color: var(--muted2);
+      line-height: 1.5;
+    }
+    #drop-zone .hint strong { color: var(--accent2); }
+    #file-input { display: none; }
+
+    /* File pill */
+    #file-pill {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: .82rem;
+      margin-top: 10px;
+    }
+    #file-pill .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted2); }
+    #file-pill .clear-btn {
+      cursor: pointer; color: var(--muted); font-size: 1rem;
+      line-height: 1; background: none; border: none; padding: 2px;
+      transition: color .2s;
+    }
+    #file-pill .clear-btn:hover { color: var(--danger); }
+
+    /* Process Button */
+    #process-btn {
+      width: 100%;
+      margin-top: 12px;
+      padding: 11px;
+      border: none;
+      border-radius: var(--radius-sm);
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      color: #fff;
+      font-family: 'Inter', sans-serif;
+      font-size: .88rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: opacity .2s, transform .15s, box-shadow .2s;
+      box-shadow: 0 4px 16px rgba(108,99,255,.35);
+    }
+    #process-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(108,99,255,.45); }
+    #process-btn:active:not(:disabled) { transform: translateY(1px); }
+    #process-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* Progress bar */
+    #progress-wrap { display: none; margin-top: 12px; }
+    #progress-bar-track {
+      width: 100%; height: 4px;
+      background: var(--surface3);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    #progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 4px;
+      transition: width .4s ease;
+    }
+    #progress-label { font-size: .72rem; color: var(--muted2); margin-top: 6px; }
+
+    /* Output PDFs list */
+    #output-section { display: none; }
+    .pdf-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: background .2s, border-color .2s;
+      margin-bottom: 6px;
+    }
+    .pdf-item:hover { background: var(--surface2); border-color: var(--border); }
+    .pdf-item.active {
+      background: rgba(108,99,255,.12);
+      border-color: var(--accent);
+    }
+    .pdf-item .pdf-icon { font-size: 1.4rem; flex-shrink: 0; }
+    .pdf-item .pdf-meta { flex: 1; overflow: hidden; }
+    .pdf-item .pdf-name { font-size: .83rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .pdf-item .pdf-sub  { font-size: .7rem; color: var(--muted); margin-top: 2px; }
+    .pdf-item .pdf-badge {
+      font-size: .62rem; font-weight: 600;
+      padding: 2px 7px; border-radius: 20px;
+      white-space: nowrap;
+    }
+    .pdf-item.masked .pdf-badge  { background: rgba(248,113,113,.15); color: var(--danger); }
+    .pdf-item.report .pdf-badge  { background: rgba(34,211,168,.15); color: var(--success); }
+
+    /* Chat section */
+    #chat-section {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 0;
+      overflow: hidden;
+      min-height: 0;
+    }
+    #chat-section h3 {
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: .1em;
+      color: var(--muted);
+      text-transform: uppercase;
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #chat-history {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+    }
+    #chat-history::-webkit-scrollbar { width: 4px; }
+    #chat-history::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+    .chat-bubble {
+      max-width: 100%;
+      padding: 9px 12px;
+      border-radius: 10px;
+      font-size: .8rem;
+      line-height: 1.55;
+      word-break: break-word;
+      animation: bubbleIn .25s ease;
+    }
+    @keyframes bubbleIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .chat-bubble.user {
+      background: linear-gradient(135deg, rgba(108,99,255,.25), rgba(139,92,246,.2));
+      border: 1px solid rgba(108,99,255,.3);
+      align-self: flex-end;
+      color: var(--text);
+    }
+    .chat-bubble.assistant {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      align-self: flex-start;
+      color: var(--muted2);
+    }
+    .chat-bubble .role-label {
+      font-size: .65rem;
+      font-weight: 600;
+      letter-spacing: .06em;
+      margin-bottom: 4px;
+      opacity: .7;
+    }
+    .chat-bubble.user .role-label     { color: var(--accent2); }
+    .chat-bubble.assistant .role-label { color: var(--success); }
+
+    .chat-placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      flex: 1;
+      color: var(--muted);
+      font-size: .8rem;
+      text-align: center;
+      gap: 8px;
+      padding: 20px;
+    }
+    .chat-placeholder .icon { font-size: 2rem; opacity: .4; }
+
+    #chat-input-wrap {
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    #chat-input {
+      flex: 1;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 9px 12px;
+      font-family: 'Inter', sans-serif;
+      font-size: .82rem;
+      color: var(--text);
+      resize: none;
+      outline: none;
+      transition: border-color .2s;
+      min-height: 38px;
+      max-height: 100px;
+    }
+    #chat-input:focus { border-color: var(--accent); }
+    #chat-input::placeholder { color: var(--muted); }
+    #chat-input:disabled { opacity: .4; cursor: not-allowed; }
+
+    #send-btn {
+      width: 38px; height: 38px;
+      border: none;
+      border-radius: var(--radius-sm);
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      color: #fff;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      transition: opacity .2s, transform .15s;
+    }
+    #send-btn:hover:not(:disabled) { transform: translateY(-1px); }
+    #send-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+    /* ── Right Panel — PDF Viewer ────────────────────────── */
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    #viewer-toolbar {
+      height: 44px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      gap: 14px;
+      flex-shrink: 0;
+    }
+    #viewer-title {
+      font-size: .82rem;
+      font-weight: 500;
+      color: var(--muted2);
+      flex: 1;
+    }
+    .toolbar-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--muted2);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: .75rem;
+      font-family: 'Inter', sans-serif;
+      cursor: pointer;
+      transition: border-color .2s, color .2s;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .toolbar-btn:hover { border-color: var(--accent); color: var(--accent2); }
+
+    #pdf-frame-wrap {
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+    }
+    #pdf-frame {
+      width: 100%; height: 100%;
+      border: none;
+      background: #1e1e1e;
+    }
+
+    /* Empty state */
+    #empty-state {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      color: var(--muted);
+    }
+    #empty-state .big-icon {
+      font-size: 5rem;
+      opacity: .18;
+    }
+    #empty-state h2 {
+      font-size: 1.1rem;
+      font-weight: 500;
+      color: var(--muted2);
+    }
+    #empty-state p {
+      font-size: .83rem;
+      color: var(--muted);
+      text-align: center;
+      max-width: 300px;
+      line-height: 1.6;
+    }
+
+    /* ── Typing indicator ─────────────────────────────────── */
+    .typing-dots span {
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+      animation: blink 1.2s infinite;
+      margin: 0 2px;
+    }
+    .typing-dots span:nth-child(2) { animation-delay: .2s; }
+    .typing-dots span:nth-child(3) { animation-delay: .4s; }
+    @keyframes blink {
+      0%,80%,100% { opacity: .2; }
+      40%          { opacity: 1;  }
+    }
+
+    /* ── Toast ────────────────────────────────────────────── */
+    #toast {
+      position: fixed;
+      bottom: 24px; right: 24px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 18px;
+      font-size: .82rem;
+      display: none;
+      gap: 10px;
+      align-items: center;
+      box-shadow: var(--shadow);
+      z-index: 999;
+      max-width: 360px;
+      animation: slideUp .3s ease;
+    }
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    #toast.error { border-color: var(--danger); }
+    #toast.success { border-color: var(--success); }
+
+    /* ── Scrollbar global ─────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 6px; }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────── -->
+<header>
+  <div class="logo">
+    <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+      <path stroke-linecap="round" stroke-linejoin="round"
+        d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+    </svg>
+    PII Sanitizer
+  </div>
+  <span class="badge">v3.0</span>
+  <div class="spacer"></div>
+  <div id="status-dot"></div>
+  <span id="status-label">Checking…</span>
+</header>
+
+<!-- ── Layout ─────────────────────────────────────────────── -->
+<div class="layout">
+
+  <!-- ── Left Sidebar ─────────────────────────────────────── -->
+  <aside>
+
+    <!-- Upload -->
+    <div class="sidebar-section">
+      <h3>Upload Document</h3>
+      <div id="drop-zone">
+        <span class="icon">📄</span>
+        <p class="hint">
+          <strong>Click or drag</strong> a PDF here<br/>
+          to begin sanitization
+        </p>
+      </div>
+      <input type="file" id="file-input" accept=".pdf" />
+      <div id="file-pill">
+        <span>📎</span>
+        <span class="fname" id="pill-name"></span>
+        <button class="clear-btn" id="clear-file-btn" title="Remove">✕</button>
+      </div>
+      <button id="process-btn" disabled>
+        <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+        </svg>
+        Process PDF
+      </button>
+      <div id="progress-wrap">
+        <div id="progress-bar-track"><div id="progress-bar-fill"></div></div>
+        <div id="progress-label">Initializing…</div>
+      </div>
+    </div>
+
+    <!-- Output PDFs -->
+    <div class="sidebar-section" id="output-section">
+      <h3>Output Files</h3>
+      <div class="pdf-item masked" id="btn-masked" onclick="viewPdf('masked')">
+        <span class="pdf-icon">🔒</span>
+        <div class="pdf-meta">
+          <div class="pdf-name">masked.pdf</div>
+          <div class="pdf-sub">Redacted document</div>
+        </div>
+        <span class="pdf-badge">MASKED</span>
+      </div>
+      <div class="pdf-item report" id="btn-report" onclick="viewPdf('report')">
+        <span class="pdf-icon">📊</span>
+        <div class="pdf-meta">
+          <div class="pdf-name">report.pdf</div>
+          <div class="pdf-sub">Detection report</div>
+        </div>
+        <span class="pdf-badge">REPORT</span>
+      </div>
+    </div>
+
+    <!-- Chat -->
+    <div id="chat-section">
+      <h3>
+        <span style="margin-right:5px">💬</span> Ask about the Report
+      </h3>
+      <div id="chat-history">
+        <div class="chat-placeholder" id="chat-placeholder">
+          <span class="icon">🤖</span>
+          <span>Process a PDF first, then ask anything about the detection report.</span>
+        </div>
+      </div>
+      <div id="chat-input-wrap">
+        <textarea id="chat-input" rows="1" placeholder="Ask a question…" disabled></textarea>
+        <button id="send-btn" disabled title="Send">
+          <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── Right Viewer ──────────────────────────────────────── -->
+  <main>
+    <div id="viewer-toolbar">
+      <span id="viewer-title">No document selected</span>
+      <a id="download-btn" href="#" class="toolbar-btn" style="display:none">
+        ⬇ Download
+      </a>
+    </div>
+    <div id="pdf-frame-wrap">
+      <div id="empty-state">
+        <div class="big-icon">🛡️</div>
+        <h2>PII Sanitizer</h2>
+        <p>Upload a PDF on the left to automatically detect and redact personally identifiable information.</p>
+      </div>
+      <iframe id="pdf-frame" style="display:none" title="PDF Viewer"></iframe>
+    </div>
+  </main>
+</div>
+
+<!-- Toast -->
+<div id="toast" role="alert"></div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────
+  let currentSession = null;
+  let currentPdfType = null;
+  let selectedFile   = null;
+  const API = '';   // same origin
+
+  // ── Health check ───────────────────────────────────────────
+  async function checkHealth() {
+    try {
+      const r = await fetch(`${API}/health`);
+      const ok = r.ok;
+      document.getElementById('status-dot').className = ok ? 'ok' : 'err';
+      document.getElementById('status-label').textContent = ok ? 'API online' : 'API offline';
+    } catch {
+      document.getElementById('status-dot').className = 'err';
+      document.getElementById('status-label').textContent = 'API offline';
+    }
+  }
+  checkHealth();
+  setInterval(checkHealth, 15000);
+
+  // ── Drop zone ──────────────────────────────────────────────
+  const dropZone  = document.getElementById('drop-zone');
+  const fileInput = document.getElementById('file-input');
+  const processBtn= document.getElementById('process-btn');
+
+  dropZone.addEventListener('click', () => fileInput.click());
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dropZone.classList.remove('drag-over');
+    const f = e.dataTransfer.files[0];
+    if (f && f.name.toLowerCase().endsWith('.pdf')) setFile(f);
+    else toast('Only PDF files are accepted.', 'error');
+  });
+  fileInput.addEventListener('change', () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+
+  function setFile(f) {
+    selectedFile = f;
+    const pill = document.getElementById('file-pill');
+    document.getElementById('pill-name').textContent = f.name;
+    pill.style.display = 'flex';
+    processBtn.disabled = false;
+  }
+
+  document.getElementById('clear-file-btn').addEventListener('click', () => {
+    selectedFile = null;
+    fileInput.value = '';
+    document.getElementById('file-pill').style.display = 'none';
+    processBtn.disabled = true;
+  });
+
+  // ── Process ────────────────────────────────────────────────
+  processBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+    startProgress();
+
+    try {
+      const fd = new FormData();
+      fd.append('file', selectedFile);
+
+      setProgressLabel('Running PII detection…', 30);
+      const res = await fetch(`${API}/sanitize`, { method: 'POST', body: fd });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Pipeline failed');
+      }
+
+      setProgressLabel('Finalizing outputs…', 85);
+      const data = await res.json();
+      currentSession = data.session_id;
+
+      setProgressLabel('Done ✓', 100);
+      setTimeout(() => {
+        endProgress();
+        showOutputSection(data);
+        enableChat();
+        toast(`Sanitization complete — ${data.source_file}`, 'success');
+      }, 600);
+
+    } catch (e) {
+      endProgress();
+      toast(e.message, 'error');
+    }
+  });
+
+  function startProgress() {
+    processBtn.disabled = true;
+    document.getElementById('progress-wrap').style.display = 'block';
+    setProgressLabel('Uploading…', 10);
+  }
+
+  function setProgressLabel(msg, pct) {
+    document.getElementById('progress-label').textContent = msg;
+    document.getElementById('progress-bar-fill').style.width = pct + '%';
+  }
+
+  function endProgress() {
+    processBtn.disabled = false;
+    setTimeout(() => {
+      document.getElementById('progress-wrap').style.display = 'none';
+      document.getElementById('progress-bar-fill').style.width = '0%';
+    }, 1000);
+  }
+
+  function showOutputSection(data) {
+    document.getElementById('output-section').style.display = 'block';
+    // Auto-open masked PDF
+    viewPdf('masked');
+  }
+
+  // ── PDF Viewer ─────────────────────────────────────────────
+  function viewPdf(type) {
+    if (!currentSession) return;
+    currentPdfType = type;
+
+    // Highlight active item
+    document.querySelectorAll('.pdf-item').forEach(el => el.classList.remove('active'));
+    document.getElementById(`btn-${type}`).classList.add('active');
+
+    const url = `${API}/pdf/${currentSession}/${type}`;
+    const frame = document.getElementById('pdf-frame');
+    const empty = document.getElementById('empty-state');
+    const dlBtn  = document.getElementById('download-btn');
+    const title  = document.getElementById('viewer-title');
+
+    frame.src = url;
+    frame.style.display = 'block';
+    empty.style.display = 'none';
+
+    const labels = { masked: '🔒 masked.pdf — Redacted Document', report: '📊 report.pdf — Detection Report' };
+    title.textContent = labels[type] || type;
+
+    // Point download button directly to the attachment endpoint
+    // Server sends Content-Disposition: attachment; filename="masked.pdf" / "report.pdf"
+    dlBtn.href = `${API}/download/${currentSession}/${type}`;
+    dlBtn.style.display = 'flex';
+  }
+
+  // ── Chat ───────────────────────────────────────────────────
+  const chatInput   = document.getElementById('chat-input');
+  const sendBtn     = document.getElementById('send-btn');
+  const chatHistory = document.getElementById('chat-history');
+
+  function enableChat() {
+    chatInput.disabled = false;
+    sendBtn.disabled   = false;
+    document.getElementById('chat-placeholder').remove?.();
+    // remove placeholder node
+    const ph = document.getElementById('chat-placeholder');
+    if (ph) ph.style.display = 'none';
+  }
+
+  chatInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+  chatInput.addEventListener('input', () => {
+    chatInput.style.height = 'auto';
+    chatInput.style.height = Math.min(chatInput.scrollHeight, 100) + 'px';
+  });
+  sendBtn.addEventListener('click', sendChat);
+
+  async function sendChat() {
+    const q = chatInput.value.trim();
+    if (!q || !currentSession) return;
+
+    chatInput.value = '';
+    chatInput.style.height = 'auto';
+    chatInput.disabled = true;
+    sendBtn.disabled   = true;
+
+    appendBubble('user', q);
+    const typingId = appendTyping();
+
+    try {
+      const res = await fetch(`${API}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: currentSession, question: q }),
+      });
+      removeTyping(typingId);
+      if (!res.ok) throw new Error((await res.json()).detail || 'Chat error');
+      const data = await res.json();
+      appendBubble('assistant', data.answer);
+    } catch (e) {
+      removeTyping(typingId);
+      appendBubble('assistant', '⚠ ' + e.message);
+    } finally {
+      chatInput.disabled = false;
+      sendBtn.disabled   = false;
+      chatInput.focus();
+    }
+  }
+
+  function appendBubble(role, text) {
+    // Remove placeholder if present
+    const ph = document.getElementById('chat-placeholder');
+    if (ph) ph.remove();
+
+    const div = document.createElement('div');
+    div.className = `chat-bubble ${role}`;
+    div.innerHTML = `<div class="role-label">${role === 'user' ? 'YOU' : 'AI ASSISTANT'}</div>${escHtml(text)}`;
+    chatHistory.appendChild(div);
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+    return div;
+  }
+
+  let typingCounter = 0;
+  function appendTyping() {
+    const id = 'typing-' + (++typingCounter);
+    const div = document.createElement('div');
+    div.className = 'chat-bubble assistant';
+    div.id = id;
+    div.innerHTML = `<div class="role-label">AI ASSISTANT</div>
+      <span class="typing-dots"><span></span><span></span><span></span></span>`;
+    chatHistory.appendChild(div);
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+    return id;
+  }
+
+  function removeTyping(id) {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  }
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+              .replace(/\n/g,'<br/>');
+  }
+
+  // ── Toast ──────────────────────────────────────────────────
+  let toastTimer;
+  function toast(msg, type = 'info') {
+    const el = document.getElementById('toast');
+    const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+    el.innerHTML = `<span>${icons[type] || ''}</span> ${escHtml(msg)}`;
+    el.className = type;
+    el.style.display = 'flex';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.style.display = 'none'; }, 5000);
+  }
+</script>
+</body>
+</html>

@@ -19,6 +19,9 @@ def generate_report(
     entities: list[dict],
     review_log: list[dict],
     processing_seconds: float,
+    llm_json_results: list[dict] | None = None,
+    accepted_agent_rows: list[dict] | None = None,
+    agent_review_rows: list[dict] | None = None,
 ) -> None:
     print("[REPORT] Generating report PDF")
     doc = SimpleDocTemplate(output_path, pagesize=A4)
@@ -34,10 +37,6 @@ def generate_report(
         f"<b>Date:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"<b>Total Pages:</b> {total_pages}",
         f"<b>Processing Time:</b> {processing_seconds:.2f}s",
-        (
-            f"<b>Native Pages:</b> {extraction_mode_summary.get('native', 0)} | "
-            f"<b>OCR Pages:</b> {extraction_mode_summary.get('ocr', 0)}"
-        ),
     ]
     for line in meta:
         story.append(Paragraph(line, styles["Normal"]))

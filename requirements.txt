@@ -3,9 +3,10 @@ uvicorn[standard]
 python-multipart
 pymupdf
 pdfplumber
-pytesseract
+pypdfium2
 pdf2image
 Pillow
+python-doctr
 spacy
 presidio-analyzer
 presidio-anonymizer
@@ -16,5 +17,3 @@ zipfile36
 openai
 python-dotenv
 requests
-fast_mcp
-mcp_use

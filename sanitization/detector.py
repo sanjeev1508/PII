@@ -2,12 +2,13 @@
 Entity detection pipeline using Microsoft Presidio + spaCy + custom regex patterns.
 Applies validators to reduce false positives.
 """
+import json
 from pathlib import Path
 
 import yaml
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
 from presidio_analyzer.nlp_engine import NlpEngineProvider
-from sanitization.llm_classifier import llm_is_sensitive
+from sanitization.llm_classifier import llm_classify_batch
 
 from sanitization.validators import (
     is_real_address,
@@ -75,7 +76,7 @@ def _jurisdiction_recognizer() -> PatternRecognizer:
     return PatternRecognizer(supported_entity="JURISDICTION", patterns=patterns, supported_language="en")
 
 
-def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[dict]]:
+def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """
     Run detection on all extracted pages.
     Returns list of detected entity dicts with page, type, value, start, end, confidence.
@@ -85,7 +86,7 @@ def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[d
         analyzer = build_analyzer()
     except Exception as e:
         print(f"[DETECT] Analyzer init failed: {e}")
-        return [], []
+        return [], [], [], []
 
     enabled_types = {e["type"]: e for e in config["entities"] if e.get("enabled", True)}
     llm_cfg = config.get("llm_review", {})
@@ -93,9 +94,20 @@ def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[d
     llm_min_conf = float(llm_cfg.get("min_confidence", 0.5))
     llm_model = llm_cfg.get("model", "gpt-4.1-mini")
     llm_fail_open = bool(llm_cfg.get("fail_open_on_error", True))
+    llm_review_entity_types = set(llm_cfg.get("review_entity_types", []))
+    llm_max_reviews = int(llm_cfg.get("max_reviews_per_document", 250))
+    llm_batch_size = int(llm_cfg.get("batch_size", 50))
+    llm_reference_path = llm_cfg.get("reference_file", "outputs/llm/reference_scores.json")
+    llm_skills_path = llm_cfg.get("skills_file", "SKILLS.md")
+    llm_decision_cache: dict[tuple[str, str], tuple[bool, str]] = {}
+    pending_reviews: list[dict] = []
+    pending_unique: dict[tuple[str, str], dict] = {}
+    llm_json_results: list[dict] = []
     all_entities = []
     review_log = []
+    candidate_pool = []
     entity_id_counter = {}
+    score_accumulator: dict[str, list[float]] = {}
 
     for page_data in pages:
         page_num = page_data["page"]
@@ -120,6 +132,7 @@ def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[d
             cfg = enabled_types[entity_type]
             max_conf = float(cfg.get("confidence_threshold", 0.5))
             score = float(result.score)
+            score_accumulator.setdefault(entity_type, []).append(score)
             if score < llm_min_conf:
                 review_log.append(
                     {
@@ -149,27 +162,48 @@ def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[d
                 )
                 continue
 
+            candidate_pool.append(
+                {
+                    "page": page_num,
+                    "type": entity_type,
+                    "value": value,
+                    "start": result.start,
+                    "end": result.end,
+                    "confidence": round(score, 3),
+                    "mask_template": cfg.get("mask_template", f"[{entity_type}-{{id}}]"),
+                }
+            )
+
             allow_mask = score >= max_conf
-            llm_reviewed = False
-            llm_classification = None
-            if not allow_mask and llm_enabled and score < max_conf:
+            should_review_type = not llm_review_entity_types or entity_type in llm_review_entity_types
+            if not allow_mask and llm_enabled and score < max_conf and should_review_type:
                 context_start = max(0, result.start - 80)
                 context_end = min(len(text), result.end + 80)
                 context = text[context_start:context_end].replace("\n", " ").strip()
-                llm_reviewed = True
-                try:
-                    allow_mask = llm_is_sensitive(
-                        entity_type=entity_type,
-                        value=value,
-                        confidence=score,
-                        context=context,
-                        model=llm_model,
-                    )
-                    llm_classification = "SENSITIVE" if allow_mask else "NOT_SENSITIVE"
-                except Exception as e:
-                    print(f"[DETECT] LLM review failed ({entity_type}): {e}")
-                    allow_mask = llm_fail_open
-                    llm_classification = "ERROR"
+                cache_key = (entity_type, value.lower())
+                if cache_key not in pending_unique and len(pending_unique) < llm_max_reviews:
+                    candidate_id = f"cand_{len(pending_unique) + 1}"
+                    pending_unique[cache_key] = {
+                        "id": candidate_id,
+                        "entity_type": entity_type,
+                        "value": value,
+                        "confidence": round(score, 3),
+                        "context": context,
+                    }
+                pending_reviews.append(
+                    {
+                        "page": page_num,
+                        "type": entity_type,
+                        "value": value,
+                        "start": result.start,
+                        "end": result.end,
+                        "confidence": round(score, 3),
+                        "mask_template": cfg.get("mask_template", f"[{entity_type}-{{id}}]"),
+                        "cache_key": cache_key,
+                    }
+                )
+                continue
+
             if not allow_mask:
                 review_log.append(
                     {
@@ -179,14 +213,9 @@ def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[d
                         "confidence": round(score, 3),
                         "decision": "REJECTED",
                         "reason": (
-                            "llm_not_sensitive"
-                            if llm_reviewed and llm_classification != "ERROR"
-                            else "llm_error_rejected"
-                            if llm_reviewed
-                            else "below_max_threshold"
+                            "below_max_threshold"
                         ),
-                        "review_method": "LLM" if llm_reviewed else "THRESHOLD",
-                        "llm_classification": llm_classification,
+                        "review_method": "THRESHOLD",
                     }
                 )
                 continue
@@ -202,9 +231,9 @@ def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[d
                     "end": result.end,
                     "confidence": round(score, 3),
                     "mask": cfg.get("mask_template", f"[{entity_type}-{{id}}]").format(id=eid),
-                    "llm_reviewed": llm_reviewed,
-                    "llm_classification": llm_classification,
-                    "review_method": "LLM" if llm_reviewed else "THRESHOLD",
+                    "llm_reviewed": False,
+                    "llm_classification": None,
+                    "review_method": "THRESHOLD",
                 }
             )
             review_log.append(
@@ -214,20 +243,94 @@ def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[d
                     "value": value,
                     "confidence": round(score, 3),
                     "decision": "MASKED",
-                    "reason": (
-                        "above_max_threshold"
-                        if not llm_reviewed
-                        else "llm_error_masked"
-                        if llm_classification == "ERROR"
-                        else "llm_sensitive"
-                    ),
-                    "review_method": "LLM" if llm_reviewed else "THRESHOLD",
-                    "llm_classification": llm_classification,
+                    "reason": "above_max_threshold",
+                    "review_method": "THRESHOLD",
                 }
             )
 
+    # Always persist confidence reference snapshot for this run, even if no LLM review happens.
+    _write_reference_file(llm_reference_path, score_accumulator)
+
+    if pending_reviews:
+        if pending_unique:
+            batch_candidates = list(pending_unique.values())
+            print(f"[DETECT] LLM batch review candidates: {len(batch_candidates)}")
+            llm_results, llm_json_results = llm_classify_batch(
+                batch_candidates,
+                model=llm_model,
+                batch_size=llm_batch_size,
+                reference_path=llm_reference_path,
+                skills_path=llm_skills_path,
+            )
+            for key, item in pending_unique.items():
+                decision = llm_results.get(item["id"], "ERROR")
+                if decision == "MASK":
+                    llm_decision_cache[key] = (True, "SENSITIVE")
+                elif decision == "KEEP":
+                    llm_decision_cache[key] = (False, "NOT_SENSITIVE")
+                else:
+                    llm_decision_cache[key] = (llm_fail_open, "ERROR")
+
+        for item in pending_reviews:
+            cache_key = item["cache_key"]
+            if cache_key not in llm_decision_cache:
+                llm_decision_cache[cache_key] = (llm_fail_open, "SKIPPED_LIMIT")
+            allow_mask, llm_classification = llm_decision_cache[cache_key]
+
+            if allow_mask:
+                entity_type = item["type"]
+                entity_id_counter[entity_type] = entity_id_counter.get(entity_type, 0) + 1
+                eid = entity_id_counter[entity_type]
+                all_entities.append(
+                    {
+                        "page": item["page"],
+                        "type": entity_type,
+                        "value": item["value"],
+                        "start": item["start"],
+                        "end": item["end"],
+                        "confidence": item["confidence"],
+                        "mask": item["mask_template"].format(id=eid),
+                        "llm_reviewed": True,
+                        "llm_classification": llm_classification,
+                        "review_method": "LLM",
+                    }
+                )
+                review_log.append(
+                    {
+                        "page": item["page"],
+                        "type": entity_type,
+                        "value": item["value"],
+                        "confidence": item["confidence"],
+                        "decision": "MASKED",
+                        "reason": (
+                            "llm_sensitive"
+                            if llm_classification == "SENSITIVE"
+                            else "llm_error_masked"
+                            if llm_classification == "ERROR"
+                            else "llm_skipped_limit_masked"
+                        ),
+                        "review_method": "LLM",
+                        "llm_classification": llm_classification,
+                    }
+                )
+            else:
+                review_log.append(
+                    {
+                        "page": item["page"],
+                        "type": item["type"],
+                        "value": item["value"],
+                        "confidence": item["confidence"],
+                        "decision": "REJECTED",
+                        "reason": "llm_not_sensitive",
+                        "review_method": "LLM",
+                        "llm_classification": llm_classification,
+                    }
+                )
+    else:
+        print("[DETECT] LLM batch review candidates: 0")
+
     print(f"[DETECT] Detection complete. Found {len(all_entities)} entities")
-    return all_entities, review_log
+    return all_entities, review_log, llm_json_results, candidate_pool
 
 
 def _validate(entity_type: str, value: str, cfg: dict) -> bool:
@@ -262,3 +365,18 @@ def _map_to_presidio_types(types: list[str]) -> list[str]:
 def _map_from_presidio(presidio_type: str) -> str:
     reverse = {"LOCATION": "ADDRESS"}
     return reverse.get(presidio_type, presidio_type)
+
+
+def _write_reference_file(reference_path: str, score_accumulator: dict[str, list[float]]) -> None:
+    path = Path(reference_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    summary = {
+        entity_type: {
+            "count": len(scores),
+            "avg_confidence": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            "min_confidence": round(min(scores), 4) if scores else 0.0,
+            "max_confidence": round(max(scores), 4) if scores else 0.0,
+        }
+        for entity_type, scores in score_accumulator.items()
+    }
+    path.write_text(json.dumps({"entity_confidence_summary": summary}, indent=2), encoding="utf-8")
