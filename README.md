@@ -1,140 +1,70 @@
-# PDF Sanitization API
+# PII Sanitizer — Agentic Architecture (V4.0)
 
-FastAPI backend for document sanitization with native PDF extraction, OCR fallback, configurable entity detection, validation, masking, and report generation.
+A high-performance FastAPI and Agentic-AI backend for document sanitization. This system features native PDF extraction, chunked OCR fallback, an ensemble of Named Entity Recognition (NER), LLM validation, strict O(N) deduplication, and single-pass PyMuPDF redaction.
 
-The system now runs with an agentic orchestration layer that coordinates hybrid spaCy/Presidio detection, memory lookup in Qdrant, and LLM judging.
+V4.0 introduces an entirely new **Agentic Orchestration Pipeline** connected to a premium, glassmorphic UI via Server-Sent Events (SSE) for real-time progress tracking.
 
-Hybrid routing rule:
-- candidates with detector confidence `> 0.90` are masked directly (spaCy/Presidio path)
-- candidates with confidence `> 0.50` and `<= 0.90` are routed to the async LLM agent
-- all candidates with confidence `> 0.50` are stored in Qdrant
+## 🚀 Extreme Performance Optimizations
 
-OCR behavior:
-- native extraction is used when page text is available
-- OCR uses Doctr only (pages rendered with PDFium before recognition)
-- OCR pages are processed in parallel worker threads (set `OCR_WORKERS` env var, default `4`)
+This system is built to handle massive, 100+ page financial and legal documents (e.g., 10-K filings, court records) in **under 30 seconds**.
 
-## Pipeline Stages
+- **PyMuPDF native tables**: Replaced `pdfplumber` with PyMuPDF's C-compiled `find_tables()`, bringing table extraction time from minutes down to milliseconds.
+- **Embedded Image Limits**: Automatically filters out invisible 1x1 structural pixel spacers prevalent in SEC filings from hitting the deep learning doctr engine.
+- **Chunked OCR Batching**: Uses adaptive threading and dynamically batched OCR to avoid RAM saturation without sacrificing CPU throughput.
+- **Single-Pass Redaction**: Uses a 1-pass zero-deflate PyMuPDF operation to mask entities and reconstruct PDFs in 1–2 seconds, entirely dropping `garbage=4` compressions.
+- **Lightweight NLP Ensemble**: Relies on `en_core_web_lg` combined with Presidio and custom Regex engines to provide ultra-fast heuristic detection. Heavy CPU-bound Transformer logic (`dslim/bert-base-NER`) is disabled by default for maximum throughput.
 
-- `[EXTRACT]` Native text extraction by page with OCR fallback for low-text pages.
-- `[DETECT]` Presidio + spaCy + custom recognizers with validation filters.
-- `[MASK]` PDF redaction using PyMuPDF text search and redact annotations.
-- `[REPORT]` PDF report generation and final ZIP bundling.
+## 🧠 Pipeline Agents
 
-## Architecture
+The process runs sequentially across highly optimized autonomous agents:
 
-See the full architecture diagram in `docs/architecture.md`.
+1. `ExtractionAgent`: Parallel chunked native text, C-speed table extraction, and image OCR.
+2. `DetectionAgent`: ThreadPool chunked execution of Presidio (spaCy `en_core_web_lg`) and custom validators. Passes high-confidence signals and captures low-confidence boundary edge cases.
+3. `ResolutionAgent`: O(N log N) Exact-match dictionary deduping combined with fuzzy clustering for cross-page entity normalization.
+4. `ReviewAgent`: Defers ambiguous or conflicting entities to a Batch LLM (OpenAI/Anthropic) using Qdrant vector-store memory of past programmatic decisions.
+5. `MaskingAgent`: Receives the resolved manifest and does a single-pass `fitz` traversal to draw bounding boxes and apply true destruction to underlying PDF strings.
+6. `ReportingAgent`: Generates a high-quality summary PDF detailing mask counts and LLM categorization decisions.
 
-## Configuration
+## 💻 The Dashboard
 
-Entity behavior is controlled in `configs/entities.yaml`:
+A modern, glassmorphic, vanilla HTML/JS interactive dashboard is served automatically at `/`.
+- **Drag-and-drop** PDF ingestion.
+- **Live SSE Progress**: Watch agents execute your document in real-time.
+- **Entity Highlighting**: Draw yellow, translucent bounding boxes over exactly what the ML pipeline detected.
+- **Side-by-Side Compare**: Compare your pre-masked document with the masked output securely in the browser using `pdf.js`.
+- **LLM Chat**: Post-process, you can chat with the reporting agent explicitly about the generated entity data.
 
-- Enable/disable each entity type.
-- Confidence threshold per type.
-- Optional validators (Luhn, address formatting).
-- Mask templates.
-- Optional LLM review for borderline scores (`llm_review` block).
-
-`FINANCIAL_AMOUNT` is the canonical amount entity type.
-
-## Run
+## ⚙️ Build and Run
 
 ```bash
+# 1. Install dependencies
 pip install -r requirements.txt
+
+# 2. Download the core spaCy engine
 python -m spacy download en_core_web_lg
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+# 3. Start the server (models pre-warm immediately at boot)
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-### Environment
+### Environment Overrides
 
-Create a `.env` file in project root (`OCR/`) when using LLM review:
+Create a `.env` file to customize agent parameters:
 
 ```env
 OPENAI_API_KEY=your_openai_key
+EXTRACTOR_WORKERS=6
+DETECT_WORKERS=4
+OCR_MIN_NATIVE_CHARS=80
+ENABLE_HF_NER=0         # Set to 1 to enable BERT baseline (WARNING: Extremely slow on CPU)
 ```
 
-The generated PDF report now includes separate LLM review annotations for borderline entities that required classification.
+## 🌐 API Endpoints
 
-## API
-
-- `GET /health`
-- `POST /sanitize` (multipart form-data, file field name: `file`)
-
-Example:
-
-```bash
-curl -X POST "http://localhost:8000/sanitize" ^
-  -H "accept: application/zip" ^
-  -H "Content-Type: multipart/form-data" ^
-  -F "file=@your.pdf" ^
-  --output sanitized_bundle.zip
-```
-
-Response ZIP contains:
-
-- `masked.pdf`
-- `report.pdf`
-
-## Threshold + LLM Review Behavior
-
-For each entity candidate:
-
-- score `< llm_review.min_confidence`: reject.
-- score `>= confidence_threshold`: mask directly.
-- score between min and max threshold: send candidates to batch LLM fallback (`MASK` vs `KEEP`) and mask only `MASK`.
-
-The fallback also reads:
-
-- `SKILLS.md` (description, role, references)
-- `outputs/llm/reference_scores.json` (local confidence summary generated after detection)
-
-LLM JSON decisions are added to the generated `report.pdf`.
-
-## Qdrant Agent (Unreported High-Confidence Candidates)
-
-The pipeline also stores candidates in local Qdrant when they:
-
-- have confidence above `qdrant.min_confidence_percent` (default `50`)
-- are `REJECTED` in review flow
-- are not part of the LLM-reviewed section in `report.pdf`
-
-Agent pipeline behavior:
-
-- sends all candidates above confidence threshold (default `> 50%`) asynchronously to OpenAI for PII acceptance
-- writes acceptance fields per payload:
-  - `accepted_as_pii` (boolean)
-  - `pii_decision` (`accepted_pii` or `not_accepted`)
-  - `pii_reason` (short model reason)
-- stores enriched payloads into local Qdrant
-- masks only `accepted_pii` rows
-- adds all reviewed rows (`confidence > 50`) and accepted rows into final `report.pdf`
-
-Configure in `configs/entities.yaml`:
-
-- `orchestration.direct_spacy_confidence`
-- `qdrant.enabled`
-- `qdrant.url` (default `http://localhost:6333`)
-- `qdrant.collection`
-- `qdrant.min_confidence_percent`
-- `qdrant.agent_model`
-- `qdrant.agent_batch_size`
-
-Optional env overrides:
-
-- `QDRANT_URL`
-- `QDRANT_COLLECTION`
-- `QDRANT_MIN_CONFIDENCE_PERCENT`
-
-### Performance Notes (Large PDFs)
-
-Hybrid mode can become slow if every borderline candidate triggers a separate remote call. To keep runtime efficient:
-
-- Use `llm_review.review_entity_types` to review only ambiguous entities (for example `PARTY_NAME`, `ADDRESS`, `JURISDICTION`).
-- Keep deterministic entities like `FINANCIAL_AMOUNT` on direct threshold masking (adjust threshold accordingly).
-- Use `llm_review.batch_size` to control batch request size.
-- Use `llm_review.max_reviews_per_document` to cap review calls per document.
-- Repeated values are cached per document, so identical spans are reviewed once.
-
-## Output Directory
-
-Keep `outputs/pdfs/` in the repository for sanitized PDF outputs/workflow compatibility.
+- `GET /` — Loads the interactive Dashboard.
+- `GET /health` — Returns status and `models_ready`.
+- `GET /ready` — 503 while model booting, 200 when ready.
+- `POST /sanitize` — Streaming endpoint that accepts a PDF file.
+- `GET /stream/{session_id}` — SSE pipeline progress hook.
+- `GET /pdf/{session_id}/{type}` — Fetch outputs (`original`, `masked`, `report`).
+- `GET /entities/{session_id}` — Resolves the JSON manifest built after masking.
