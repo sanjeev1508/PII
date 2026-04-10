@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
 from presidio_analyzer.nlp_engine import NlpEngineProvider
+from sanitization.llm_classifier import llm_is_sensitive
 
 from sanitization.validators import (
     is_real_address,
@@ -74,7 +75,7 @@ def _jurisdiction_recognizer() -> PatternRecognizer:
     return PatternRecognizer(supported_entity="JURISDICTION", patterns=patterns, supported_language="en")
 
 
-def detect_entities(pages: list[dict], config: dict) -> list[dict]:
+def detect_entities(pages: list[dict], config: dict) -> tuple[list[dict], list[dict]]:
     """
     Run detection on all extracted pages.
     Returns list of detected entity dicts with page, type, value, start, end, confidence.
@@ -84,10 +85,16 @@ def detect_entities(pages: list[dict], config: dict) -> list[dict]:
         analyzer = build_analyzer()
     except Exception as e:
         print(f"[DETECT] Analyzer init failed: {e}")
-        return []
+        return [], []
 
     enabled_types = {e["type"]: e for e in config["entities"] if e.get("enabled", True)}
+    llm_cfg = config.get("llm_review", {})
+    llm_enabled = bool(llm_cfg.get("enabled", False))
+    llm_min_conf = float(llm_cfg.get("min_confidence", 0.5))
+    llm_model = llm_cfg.get("model", "gpt-4.1-mini")
+    llm_fail_open = bool(llm_cfg.get("fail_open_on_error", True))
     all_entities = []
+    review_log = []
     entity_id_counter = {}
 
     for page_data in pages:
@@ -111,11 +118,77 @@ def detect_entities(pages: list[dict], config: dict) -> list[dict]:
             if entity_type not in enabled_types:
                 continue
             cfg = enabled_types[entity_type]
-            if result.score < cfg.get("confidence_threshold", 0.5):
+            max_conf = float(cfg.get("confidence_threshold", 0.5))
+            score = float(result.score)
+            if score < llm_min_conf:
+                review_log.append(
+                    {
+                        "page": page_num,
+                        "type": entity_type,
+                        "value": text[result.start : result.end].strip(),
+                        "confidence": round(score, 3),
+                        "decision": "REJECTED",
+                        "reason": "below_min_threshold",
+                        "review_method": "THRESHOLD",
+                    }
+                )
                 continue
 
             value = text[result.start : result.end].strip()
             if not _validate(entity_type, value, cfg):
+                review_log.append(
+                    {
+                        "page": page_num,
+                        "type": entity_type,
+                        "value": value,
+                        "confidence": round(score, 3),
+                        "decision": "REJECTED",
+                        "reason": "validator_rejected",
+                        "review_method": "VALIDATOR",
+                    }
+                )
+                continue
+
+            allow_mask = score >= max_conf
+            llm_reviewed = False
+            llm_classification = None
+            if not allow_mask and llm_enabled and score < max_conf:
+                context_start = max(0, result.start - 80)
+                context_end = min(len(text), result.end + 80)
+                context = text[context_start:context_end].replace("\n", " ").strip()
+                llm_reviewed = True
+                try:
+                    allow_mask = llm_is_sensitive(
+                        entity_type=entity_type,
+                        value=value,
+                        confidence=score,
+                        context=context,
+                        model=llm_model,
+                    )
+                    llm_classification = "SENSITIVE" if allow_mask else "NOT_SENSITIVE"
+                except Exception as e:
+                    print(f"[DETECT] LLM review failed ({entity_type}): {e}")
+                    allow_mask = llm_fail_open
+                    llm_classification = "ERROR"
+            if not allow_mask:
+                review_log.append(
+                    {
+                        "page": page_num,
+                        "type": entity_type,
+                        "value": value,
+                        "confidence": round(score, 3),
+                        "decision": "REJECTED",
+                        "reason": (
+                            "llm_not_sensitive"
+                            if llm_reviewed and llm_classification != "ERROR"
+                            else "llm_error_rejected"
+                            if llm_reviewed
+                            else "below_max_threshold"
+                        ),
+                        "review_method": "LLM" if llm_reviewed else "THRESHOLD",
+                        "llm_classification": llm_classification,
+                    }
+                )
                 continue
 
             entity_id_counter[entity_type] = entity_id_counter.get(entity_type, 0) + 1
@@ -127,13 +200,34 @@ def detect_entities(pages: list[dict], config: dict) -> list[dict]:
                     "value": value,
                     "start": result.start,
                     "end": result.end,
-                    "confidence": round(result.score, 3),
+                    "confidence": round(score, 3),
                     "mask": cfg.get("mask_template", f"[{entity_type}-{{id}}]").format(id=eid),
+                    "llm_reviewed": llm_reviewed,
+                    "llm_classification": llm_classification,
+                    "review_method": "LLM" if llm_reviewed else "THRESHOLD",
+                }
+            )
+            review_log.append(
+                {
+                    "page": page_num,
+                    "type": entity_type,
+                    "value": value,
+                    "confidence": round(score, 3),
+                    "decision": "MASKED",
+                    "reason": (
+                        "above_max_threshold"
+                        if not llm_reviewed
+                        else "llm_error_masked"
+                        if llm_classification == "ERROR"
+                        else "llm_sensitive"
+                    ),
+                    "review_method": "LLM" if llm_reviewed else "THRESHOLD",
+                    "llm_classification": llm_classification,
                 }
             )
 
     print(f"[DETECT] Detection complete. Found {len(all_entities)} entities")
-    return all_entities
+    return all_entities, review_log
 
 
 def _validate(entity_type: str, value: str, cfg: dict) -> bool:

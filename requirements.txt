@@ -13,3 +13,8 @@ usaddress
 pyyaml
 reportlab
 zipfile36
+openai
+python-dotenv
+requests
+fast_mcp
+mcp_use

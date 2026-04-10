@@ -47,7 +47,7 @@ async def sanitize(file: UploadFile = File(...)):
         for p in pages:
             mode_summary[p["method"]] = mode_summary.get(p["method"], 0) + 1
 
-        entities = detect_entities(pages, CONFIG)
+        entities, review_log = detect_entities(pages, CONFIG)
 
         masked_path = os.path.join(work_dir, "masked.pdf")
         mask_pdf(input_path, masked_path, entities)
@@ -60,6 +60,7 @@ async def sanitize(file: UploadFile = File(...)):
             total_pages=total_pages,
             extraction_mode_summary=mode_summary,
             entities=entities,
+            review_log=review_log,
             processing_seconds=elapsed,
         )
 

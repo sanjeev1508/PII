@@ -48,3 +48,9 @@ entities:
     confidence_threshold: 0.75
     max_token_length: 20
     mask_template: "[JURISDICTION-{id}]"
+
+llm_review:
+  enabled: true
+  min_confidence: 0.50
+  model: "gpt-4.1-mini"
+  fail_open_on_error: true
