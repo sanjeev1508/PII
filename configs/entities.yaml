@@ -1,32 +1,32 @@
 entities:
   - type: PERSON
     enabled: true
-    confidence_threshold: 0.80
+    confidence_threshold: 0.75
     mask_template: "[PERSON-{id}]"
 
   - type: EMAIL_ADDRESS
     enabled: true
-    confidence_threshold: 0.95
+    confidence_threshold: 0.80
     mask_template: "user_{id}@redacted.com"
 
   - type: PHONE_NUMBER
     enabled: true
-    confidence_threshold: 0.90
+    confidence_threshold: 0.60   # lowered — regex gives 0.90-0.95, spaCy may give 0.60-0.75
     mask_template: "[PHONE-{id}]"
 
   - type: CREDIT_CARD
     enabled: true
-    confidence_threshold: 0.95
+    confidence_threshold: 0.80
     validate_luhn: true
     mask_template: "[CARD-XXXX-{id}]"
 
   - type: US_SSN
     enabled: true
-    confidence_threshold: 0.95
+    confidence_threshold: 0.80
     mask_template: "[SSN-{id}]"
 
   - type: FINANCIAL_AMOUNT
-    enabled: true
+    enabled: false
     confidence_threshold: 0.80
     min_digits: 1
     mask_template: "$[AMOUNT-{id}]"
@@ -39,7 +39,7 @@ entities:
 
   - type: ADDRESS
     enabled: true
-    confidence_threshold: 0.75
+    confidence_threshold: 0.70
     validate_format: true
     mask_template: "[ADDRESS-{id}]"
 
@@ -49,36 +49,48 @@ entities:
     max_token_length: 20
     mask_template: "[JURISDICTION-{id}]"
 
+  - type: DATE_TIME
+    enabled: true
+    confidence_threshold: 0.85
+    mask_template: "[DATE-{id}]"
+
+  - type: IP_ADDRESS
+    enabled: true
+    confidence_threshold: 0.80
+    mask_template: "[IP-{id}]"
+
+  - type: US_PASSPORT
+    enabled: true
+    confidence_threshold: 0.75
+    mask_template: "[PASSPORT-{id}]"
+
+  - type: US_DRIVER_LICENSE
+    enabled: true
+    confidence_threshold: 0.75
+    mask_template: "[DL-{id}]"
+
 llm_review:
   enabled: true
-  min_confidence: 0.50
+  min_confidence: 0.50        # higher floor = fewer LLM calls
   model: "gpt-4.1-mini"
   fail_open_on_error: true
-  # Number of candidates per direct OpenAI batch request
-  batch_size: 50
-  # Local skill profile and confidence reference file consumed by the LLM
+  batch_size: 80              # larger batches = fewer API round-trips
   skills_file: "SKILLS.md"
   reference_file: "outputs/llm/reference_scores.json"
-  # Optional: review only these ambiguous types (empty list = all types)
   review_entity_types: ["PARTY_NAME", "ADDRESS", "JURISDICTION"]
-  # Safety/performance cap for LLM reviews per document
-  max_reviews_per_document: 250
+  max_reviews_per_document: 50  # cap to keep latency bounded
 
-orchestration:
-  # If detector confidence is above this value, mask directly without LLM.
-  direct_spacy_confidence: 0.90
+  # Direct mask without LLM above this confidence (lower = fewer LLM calls = faster)
+  direct_spacy_confidence: 0.70
 
 qdrant:
   enabled: true
-  # Local Docker Qdrant endpoint
   url: "http://localhost:6333"
   collection: "unreported_candidates"
-  # Threshold supports 50 (percent) or 0.5 (normalized)
-  min_confidence_percent: 50
-  # Async OpenAI agent settings for payload acceptance
+  min_confidence_percent: 40    # higher = fewer candidates stored/reviewed
   agent_model: "gpt-4.1-mini"
-  agent_batch_size: 40
+  agent_batch_size: 80
   skills_file: "SKILLS.md"
   reference_file: "outputs/llm/reference_scores.json"
-  timeout_seconds: 8
+  timeout_seconds: 5            # cut from 8s — fail fast
   vector_dim: 12

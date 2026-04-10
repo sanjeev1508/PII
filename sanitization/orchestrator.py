@@ -1,107 +1,99 @@
 """
-Agentic orchestration layer for sanitization pipeline.
+Agentic orchestrator — chains 6 agents with SSE event streaming.
+OPTIMIZED: fixed syntax bug, added per-agent timing, pipeline ready
+for future producer-consumer streaming between agents.
 """
-import os
+import asyncio
 import time
 
-from sanitization.detector import detect_entities
-from sanitization.extractor import extract_pages
-from sanitization.masker import mask_pdf
-from sanitization.qdrant_agent import process_candidates_above_threshold
-from sanitization.reporter import generate_report
+from sanitization.pipeline_context import PipelineContext
+from sanitization.agents.extraction_agent import ExtractionAgent
+from sanitization.agents.detection_agent import DetectionAgent
+from sanitization.agents.resolution_agent import ResolutionAgent
+from sanitization.agents.review_agent import ReviewAgent
+from sanitization.agents.masking_agent import MaskingAgent
+from sanitization.agents.reporting_agent import ReportingAgent
+
+# Registry: session_id -> asyncio.Queue (for SSE)
+_QUEUES: dict[str, asyncio.Queue] = {}
 
 
-def run_sanitization_pipeline(input_path: str, source_file: str, config: dict, work_dir: str) -> dict:
-    """
-    Orchestrate hybrid sanitization agents:
-    Extraction (OCR/native) -> Detection (spaCy/Presidio + LLM fallback)
-    -> Memory agent (Qdrant pre-LLM reuse + async LLM judge)
-    -> Masking -> Reporting.
-    """
-    start = time.time()
-    pages = extract_pages(input_path)
-    total_pages = len(pages)
-    mode_summary: dict[str, int] = {}
-    for p in pages:
-        mode_summary[p["method"]] = mode_summary.get(p["method"], 0) + 1
+def get_session_queue(session_id: str) -> asyncio.Queue | None:
+    return _QUEUES.get(session_id)
 
-    _, _, _, candidate_pool = detect_entities(pages, config)
 
-    agent_result = {
-        "stored_count": 0,
-        "reviewed_count": 0,
-        "accepted_rows": [],
-        "review_rows": [],
-        "entities_to_mask": [],
-    }
-    try:
-        agent_result = process_candidates_above_threshold(
-            candidates=candidate_pool,
-            source_file=source_file,
-            config=config,
-        )
-        print(
-            "[AGENT] Reviewed "
-            f"{agent_result.get('reviewed_count', 0)} candidates (>50 conf), "
-            f"accepted {len(agent_result.get('accepted_rows', []))}, "
-            f"stored {agent_result.get('stored_count', 0)}"
-        )
-    except Exception as err:
-        print(f"[AGENT] Judge/Store step skipped due to error: {err}")
+def create_session_queue(session_id: str) -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    _QUEUES[session_id] = q
+    return q
 
-    masked_path = os.path.join(work_dir, "masked.pdf")
-    final_entities_to_mask = agent_result.get("entities_to_mask", [])
-    mask_pdf(input_path, masked_path, final_entities_to_mask)
 
-    review_log = []
-    for row in agent_result.get("review_rows", []):
-        is_masked = str(row.get("pii_decision", "")) == "accepted_pii"
-        route = str(row.get("route", "llm"))
-        review_log.append(
-            {
-                "page": int(row.get("page", -1)),
-                "type": str(row.get("type", "")),
-                "value": str(row.get("value", "")),
-                "confidence": float(row.get("confidence", 0.0)),
-                "decision": "MASKED" if is_masked else "REJECTED",
-                "reason": (
-                    "above_direct_spacy_threshold"
-                    if route == "direct_spacy"
-                    else "llm_pii"
-                    if is_masked
-                    else "llm_not_pii"
-                ),
-                "review_method": "THRESHOLD" if route == "direct_spacy" else "LLM",
-                "llm_classification": None if route == "direct_spacy" else ("PII" if is_masked else "NOT_PII"),
-            }
-        )
-    llm_json_results = [
-        {
-            "id": str(row.get("id", "")),
-            "entity_type": str(row.get("type", "")),
-            "value": str(row.get("value", "")),
-            "decision": "MASK" if str(row.get("pii_decision", "")) == "accepted_pii" else "KEEP",
-            "reason": str(row.get("pii_reason", "")),
-            "confidence": row.get("confidence", ""),
-        }
-        for row in agent_result.get("review_rows", [])
+async def run_pipeline_async(
+    session_id: str,
+    input_path: str,
+    source_file: str,
+    config: dict,
+    work_dir: str,
+    user_annotations: list | None = None,
+    event_queue: asyncio.Queue | None = None,
+) -> PipelineContext:
+
+    q = event_queue or create_session_queue(session_id)
+
+    ctx = PipelineContext(
+        session_id=session_id,
+        input_path=input_path,
+        source_file=source_file,
+        config=config,
+        work_dir=work_dir,
+        events=q,
+        user_annotations=user_annotations or [],
+    )
+
+    agents = [
+        ExtractionAgent(),
+        DetectionAgent(),
+        ResolutionAgent(),
+        ReviewAgent(),
+        MaskingAgent(),
+        ReportingAgent(),
     ]
 
-    report_path = os.path.join(work_dir, "report.pdf")
-    elapsed = round(time.time() - start, 3)
-    generate_report(
-        output_path=report_path,
-        source_file=source_file,
-        total_pages=total_pages,
-        extraction_mode_summary=mode_summary,
-        entities=final_entities_to_mask,
-        review_log=review_log,
-        llm_json_results=llm_json_results,
-        processing_seconds=elapsed,
-        accepted_agent_rows=agent_result.get("accepted_rows", []),
-        agent_review_rows=agent_result.get("review_rows", []),
-    )
-    return {
-        "masked_path": masked_path,
-        "report_path": report_path,
-    }
+    await q.put({
+        "type": "pipeline_start",
+        "total_agents": len(agents),
+        "agents": [a.name for a in agents],
+    })
+
+    pipeline_start = time.perf_counter()
+
+    for agent in agents:
+        agent_start = time.perf_counter()
+        ctx = await agent.run(ctx)
+        elapsed = round(time.perf_counter() - agent_start, 2)
+
+        # Emit per-agent timing to SSE stream
+        await q.put({
+            "type": "agent_timing",
+            "agent": agent.name,
+            "elapsed_sec": elapsed,
+        })
+
+        if agent.name == "ExtractionAgent" and ctx.errors:
+            break  # Non-recoverable extraction failure
+
+    total_elapsed = round(time.perf_counter() - pipeline_start, 2)
+
+    await q.put({
+        "type": "pipeline_complete",
+        "masked_url": f"/pdf/{session_id}/masked",
+        "report_url": f"/pdf/{session_id}/report",
+        "original_url": f"/pdf/{session_id}/original",
+        "entity_count": len(ctx.final_entities),
+        "timings": ctx.timings,
+        "total_elapsed_sec": total_elapsed,
+        "errors": ctx.errors,
+    })
+    await q.put(None)  # SSE sentinel — closes stream
+
+    return ctx

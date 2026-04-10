@@ -167,9 +167,23 @@ def process_candidates_above_threshold(candidates: list[dict], source_file: str,
         "PARTY_NAME",
         "FINANCIAL_AMOUNT",
         "JURISDICTION",
+        "IP_ADDRESS",
+        "US_PASSPORT",
+        "US_DRIVER_LICENSE",
+    }
+    # Types that pass through at a lower floor regardless of global min_confidence
+    high_risk_floor = {
+        "PHONE_NUMBER", "US_SSN", "CREDIT_CARD", "EMAIL_ADDRESS",
+        "IP_ADDRESS", "US_PASSPORT", "US_DRIVER_LICENSE",
     }
 
-    filtered_raw = [dict(row) for row in candidates if float(row.get("confidence", 0.0)) > min_confidence]
+    def _row_passes(row: dict) -> bool:
+        conf = float(row.get("confidence", 0.0))
+        etype = str(row.get("type", ""))
+        floor = 0.30 if etype in high_risk_floor else min_confidence
+        return conf > floor
+
+    filtered_raw = [dict(row) for row in candidates if _row_passes(row)]
     if not filtered_raw:
         return {
             "stored_count": 0,

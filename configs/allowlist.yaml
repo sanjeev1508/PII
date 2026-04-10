@@ -1,0 +1,7 @@
+# Terms that are NEVER masked even if a detector fires on them.
+# Add document-specific boilerplate names/addresses here.
+allowlist:
+  PERSON: []
+  ADDRESS: []
+  PARTY_NAME: []
+  EMAIL_ADDRESS: []

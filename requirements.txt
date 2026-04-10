@@ -3,7 +3,6 @@ uvicorn[standard]
 python-multipart
 pymupdf
 pdfplumber
-pypdfium2
 pdf2image
 Pillow
 python-doctr
@@ -13,7 +12,8 @@ presidio-anonymizer
 usaddress
 pyyaml
 reportlab
-zipfile36
 openai
 python-dotenv
 requests
+transformers
+torch
