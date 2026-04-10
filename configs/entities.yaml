@@ -1,0 +1,50 @@
+entities:
+  - type: PERSON
+    enabled: true
+    confidence_threshold: 0.80
+    mask_template: "[PERSON-{id}]"
+
+  - type: EMAIL_ADDRESS
+    enabled: true
+    confidence_threshold: 0.95
+    mask_template: "user_{id}@redacted.com"
+
+  - type: PHONE_NUMBER
+    enabled: true
+    confidence_threshold: 0.90
+    mask_template: "[PHONE-{id}]"
+
+  - type: CREDIT_CARD
+    enabled: true
+    confidence_threshold: 0.95
+    validate_luhn: true
+    mask_template: "[CARD-XXXX-{id}]"
+
+  - type: US_SSN
+    enabled: true
+    confidence_threshold: 0.95
+    mask_template: "[SSN-{id}]"
+
+  - type: FINANCIAL_AMOUNT
+    enabled: true
+    confidence_threshold: 0.80
+    min_digits: 1
+    mask_template: "$[AMOUNT-{id}]"
+
+  - type: PARTY_NAME
+    enabled: true
+    confidence_threshold: 0.75
+    max_token_length: 10
+    mask_template: "[ENTITY-{id}]"
+
+  - type: ADDRESS
+    enabled: true
+    confidence_threshold: 0.75
+    validate_format: true
+    mask_template: "[ADDRESS-{id}]"
+
+  - type: JURISDICTION
+    enabled: true
+    confidence_threshold: 0.75
+    max_token_length: 20
+    mask_template: "[JURISDICTION-{id}]"

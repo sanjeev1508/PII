@@ -1,7 +1,15 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 pymupdf
+pdfplumber
+pytesseract
+pdf2image
+Pillow
 spacy
-python-doctr
+presidio-analyzer
+presidio-anonymizer
+usaddress
 pyyaml
+reportlab
+zipfile36

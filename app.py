@@ -1,72 +1,80 @@
-import io
+"""
+FastAPI backend for PDF sanitization.
+POST /sanitize  -> returns ZIP with masked.pdf + report.pdf
+GET  /health    -> health check
+"""
 import os
+import shutil
 import tempfile
+import time
 import zipfile
-from pathlib import Path
 
+import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse
 
-from sanitization.config import load_config
-from sanitization.pipeline import sanitize_document
-from sanitization.report import write_report_pdf
+from sanitization.detector import detect_entities, load_config
+from sanitization.extractor import extract_pages
+from sanitization.masker import mask_pdf
+from sanitization.reporter import generate_report
 
-app = FastAPI(title="Document Sanitization Backend", version="1.0.0")
+app = FastAPI(title="PDF Sanitization API", version="2.0.0")
+CONFIG = load_config("configs/entities.yaml")
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.post("/sanitize")
 async def sanitize(file: UploadFile = File(...)):
-    filename = file.filename or "uploaded.pdf"
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
-    cfg = load_config("configs/pipeline.yaml")
-    cfg["pipeline"]["mode"] = "redact"
+    work_dir = tempfile.mkdtemp()
+    try:
+        start = time.time()
+        print("[EXTRACT] Saving uploaded file")
 
-    with tempfile.TemporaryDirectory(prefix="sanitize_") as tmp:
-        input_pdf = os.path.join(tmp, "input.pdf")
-        masked_pdf = os.path.join(tmp, "masked.pdf")
-        report_json = os.path.join(tmp, "report.json")
-        report_pdf = os.path.join(tmp, "report.pdf")
+        input_path = os.path.join(work_dir, "input.pdf")
+        with open(input_path, "wb") as f:
+            f.write(await file.read())
 
-        content = await file.read()
-        Path(input_pdf).write_bytes(content)
+        pages = extract_pages(input_path)
+        total_pages = len(pages)
+        mode_summary = {}
+        for p in pages:
+            mode_summary[p["method"]] = mode_summary.get(p["method"], 0) + 1
 
-        try:
-            summary = sanitize_document(
-                input_pdf=input_pdf,
-                output_pdf=masked_pdf,
-                report_file=report_json,
-                config=cfg,
-            )
-            write_report_pdf(summary, report_pdf)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Sanitization failed: {e}") from e
+        entities = detect_entities(pages, CONFIG)
 
-        bundle = io.BytesIO()
-        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.write(masked_pdf, arcname="masked.pdf")
-            zf.write(report_pdf, arcname="report.pdf")
-        bundle.seek(0)
+        masked_path = os.path.join(work_dir, "masked.pdf")
+        mask_pdf(input_path, masked_path, entities)
 
-        return StreamingResponse(
-            bundle,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{Path(filename).stem}_sanitized_bundle.zip"'},
+        report_path = os.path.join(work_dir, "report.pdf")
+        elapsed = round(time.time() - start, 3)
+        generate_report(
+            output_path=report_path,
+            source_file=file.filename,
+            total_pages=total_pages,
+            extraction_mode_summary=mode_summary,
+            entities=entities,
+            processing_seconds=elapsed,
         )
 
+        print("[REPORT] Bundling output PDFs")
+        zip_path = os.path.join(work_dir, "sanitized_bundle.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(masked_path, "masked.pdf")
+            zf.write(report_path, "report.pdf")
 
-@app.get("/")
-def root():
-    return JSONResponse(
-        {
-            "message": "Upload PDF to POST /sanitize",
-            "output": "ZIP with masked.pdf and report.pdf",
-        }
-    )
+        return FileResponse(path=zip_path, media_type="application/zip", filename="sanitized_bundle.zip")
+    except Exception as e:
+        print(f"[REPORT] Pipeline error: {e}")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
