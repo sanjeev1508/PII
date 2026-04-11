@@ -1,39 +1,38 @@
 """
-PDF extraction — OPTIMIZED for large PDFs.
+PDF extraction — native text and/or full-page docTR OCR.
 
-Key fixes for large-page-count PDFs:
-  1. Chunked OCR batching (OCR_CHUNK_SIZE pages at a time) — prevents RAM exhaustion
-     that caused 94s+ hangs on large scanned docs
-  2. JPEG temp files instead of PNG — 5x smaller, faster disk I/O during OCR
-  3. Adaptive worker count — scales down for large PDFs to avoid memory pressure
-  4. Progress callback — ExtractionAgent can stream per-chunk progress to SSE
-  5. Explicit PIL image del after save — keeps peak RAM low
-  6. Page-content hash cache — skip re-OCR for repeated pages within a session
+EXTRACT_OCR_MODE:
+  full_page (default) — Render every page at OCR_DPI, run docTR in batches (like a standalone
+    fitz→PIL→numpy script). Text visible only inside images/logos on the page is included in OCR.
+  native_first — Use PyMuPDF text when >= MIN_NATIVE_CHARS; docTR only for “empty” pages (faster
+    on text-born PDFs but misses bitmap-only text on otherwise dense pages).
+
+Embedded rasters are still OCR’d separately in extract_embedded_images (xref + masking).
 
 Returns: [{page: int, text: str, method: str}]
 """
 import concurrent.futures
-import hashlib
 import io
-import math
 import os
-import threading
-from functools import lru_cache
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import fitz
+import numpy as np
 from PIL import Image
 
 # ── Tuning (all overridable via env vars) ─────────────────────────────────────
+_EXTRACT_MODE_RAW = os.getenv("EXTRACT_OCR_MODE", "full_page").strip().lower()
+if _EXTRACT_MODE_RAW not in ("full_page", "native_first"):
+    print(f"[EXTRACT] Unknown EXTRACT_OCR_MODE={_EXTRACT_MODE_RAW!r}, using native_first")
+    EXTRACT_OCR_MODE = "native_first"
+else:
+    EXTRACT_OCR_MODE = _EXTRACT_MODE_RAW
 MIN_NATIVE_CHARS = int(os.getenv("MIN_NATIVE_CHARS", "80"))
-OCR_DPI          = int(os.getenv("OCR_DPI", "96"))   # Reduced from 150 -> 96 for speed
-OCR_MAX_SIDE     = int(os.getenv("OCR_MAX_SIDE", "1024")) # Reduced from 1400 -> 1024
-MAX_WORKERS      = int(os.getenv("EXTRACTOR_WORKERS", "6"))
-
-# How many OCR pages to send to doctr in one batch.
-# Larger = faster for small docs. For 100+ pages keep ≤15 to avoid RAM spikes.
-OCR_CHUNK_SIZE   = int(os.getenv("OCR_CHUNK_SIZE", "12"))
+OCR_DPI          = int(os.getenv("OCR_DPI", "150"))
+# 0 = no resize (full pixmap like standalone script; uses more RAM)
+OCR_MAX_SIDE     = int(os.getenv("OCR_MAX_SIDE", "0"))
+CPU_COUNT        = os.cpu_count() or 4
+MAX_WORKERS      = int(os.getenv("EXTRACTOR_WORKERS", str(min(8, CPU_COUNT))))
+OCR_CHUNK_SIZE   = int(os.getenv("OCR_CHUNK_SIZE", "8"))
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -58,47 +57,111 @@ def _read_native_page(args):
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
+def _run_doctr_on_page_indices(
+    pdf_path: str,
+    page_indices: list[int],
+    progress_cb,
+    total_for_progress: int,
+) -> list[tuple[int, str]]:
+    """Render selected pages and return [(page_idx, ocr_text), ...] in same order as indices."""
+    from sanitization.doctr_ocr import run_batch_ocr
+
+    out: list[tuple[int, str]] = []
+    doc = fitz.open(pdf_path)
+    try:
+        done = 0
+        for chunk_start in range(0, len(page_indices), OCR_CHUNK_SIZE):
+            chunk_indices = page_indices[chunk_start : chunk_start + OCR_CHUNK_SIZE]
+            arrs: list[np.ndarray] = []
+            for pi in chunk_indices:
+                page = doc[pi]
+                pix = page.get_pixmap(dpi=OCR_DPI)
+                pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                if OCR_MAX_SIDE > 0:
+                    pil_img = _resize(pil_img, OCR_MAX_SIDE)
+                arrs.append(np.asarray(pil_img, dtype=np.uint8))
+                del pil_img
+            texts = run_batch_ocr(arrs)
+            for pi, txt in zip(chunk_indices, texts):
+                out.append((pi, txt))
+            done += len(chunk_indices)
+            if progress_cb:
+                progress_cb(done, total_for_progress)
+    finally:
+        doc.close()
+    return out
+
+
 def extract_pages(
     pdf_path: str,
     progress_cb=None,   # optional callback(done_pages, total_ocr_pages)
 ) -> list[dict]:
     """
-    Fast-path: parallel native PyMuPDF text per page.
-    Fallback: parallel JPEG render → chunked doctr batches for OCR pages.
-    progress_cb(done, total) is called after each OCR chunk.
+    See EXTRACT_OCR_MODE at module top.
+
+    If a page contains embedded images, we run docTR OCR on that page.
+    Pages with no images are extracted via PyMuPDF text only, which is faster and preserves text quality.
     """
     import time
     t0 = time.perf_counter()
-    print("[EXTRACT] Starting parallel extraction")
+    print(f"[EXTRACT] Starting extraction (mode={EXTRACT_OCR_MODE!r})")
 
     doc = fitz.open(pdf_path)
-    n_pages = len(doc)
-    doc.close()
+    try:
+        n_pages = len(doc)
 
-    # Adapt worker count for very large PDFs (avoid memory pressure)
-    workers = min(MAX_WORKERS, max(2, n_pages // 10))
+        workers = min(MAX_WORKERS, max(2, n_pages // 10))
+        results: list[dict] = [None] * n_pages
+        ocr_needed: list[int] = []
 
-    # ── STEP 1: Read all pages in parallel ───────────────────────────────────
-    results: list[dict] = [None] * n_pages
-    ocr_needed: list[int] = []
+        has_images = [bool(page.get_images(full=True)) for page in doc]
 
-    args = [(i, pdf_path) for i in range(n_pages)]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for page_idx, text in pool.map(_read_native_page, args):
-            if len(text) >= MIN_NATIVE_CHARS:
-                results[page_idx] = {"page": page_idx, "text": text, "method": "native"}
-            else:
-                results[page_idx] = {"page": page_idx, "text": "", "method": "ocr"}
-                ocr_needed.append(page_idx)
+        if EXTRACT_OCR_MODE == "full_page":
+            for i in range(n_pages):
+                if has_images[i]:
+                    results[i] = {"page": i, "text": "", "method": "ocr"}
+                    ocr_needed.append(i)
+                else:
+                    results[i] = {"page": i, "text": doc[i].get_text("text").strip(), "method": "native"}
+            print(
+                f"[EXTRACT] full_page image-aware: {len(ocr_needed)} pages with images will use OCR, "
+                f"{n_pages - len(ocr_needed)} pages use native text"
+            )
+        else:
+            # native_first
+            args = []
+            for i in range(n_pages):
+                if has_images[i]:
+                    results[i] = {"page": i, "text": "", "method": "ocr"}
+                    ocr_needed.append(i)
+                else:
+                    args.append((i, pdf_path))
 
-    native_count = n_pages - len(ocr_needed)
-    print(f"[EXTRACT] {n_pages} total pages native read [{time.perf_counter()-t0:.2f}s]")
+            if args:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    for page_idx, text in pool.map(_read_native_page, args):
+                        if len(text) >= MIN_NATIVE_CHARS:
+                            results[page_idx] = {"page": page_idx, "text": text, "method": "native"}
+                        else:
+                            results[page_idx] = {"page": page_idx, "text": "", "method": "ocr"}
+                            ocr_needed.append(page_idx)
 
-    if progress_cb:
-        progress_cb(n_pages, n_pages)
+            print(
+                f"[EXTRACT] native_first: {len(args)} image-free pages native-read, "
+                f"{len(ocr_needed)} pages need OCR [{time.perf_counter()-t0:.2f}s]"
+            )
 
-    print(f"[EXTRACT] Done in {time.perf_counter()-t0:.2f}s")
-    return results
+        if ocr_needed:
+            total_ocr = len(ocr_needed)
+            pairs = _run_doctr_on_page_indices(pdf_path, ocr_needed, progress_cb, total_ocr)
+            for pi, txt in pairs:
+                results[pi]["text"] = txt
+            print(f"[EXTRACT] docTR OCR {total_ocr} pages [{time.perf_counter()-t0:.2f}s elapsed]")
+
+        print(f"[EXTRACT] Done in {time.perf_counter()-t0:.2f}s")
+        return results
+    finally:
+        doc.close()
 
 
 # ── Table extraction (Ultra-fast via PyMuPDF) ─────────────────────────────────
@@ -124,51 +187,56 @@ def extract_tables(pdf_path: str) -> list[dict]:
 # ── Embedded image OCR ────────────────────────────────────────────────────────
 
 def extract_embedded_images(pdf_path: str) -> list[dict]:
-    """Base64 encode raster images embedded inside the PDF for Vision LLM."""
-    out = []
+    """OCR embedded raster images with docTR (text only; no vision / base64 to LLM)."""
+    metas: list[dict] = []
+    arrs: list[np.ndarray] = []
+    _emb_default = max(OCR_MAX_SIDE, 512) if OCR_MAX_SIDE > 0 else 1024
+    max_side = int(os.getenv("EMBEDDED_OCR_MAX_SIDE", str(_emb_default)))
     try:
-        import base64
         doc = fitz.open(pdf_path)
-
         for pg in range(len(doc)):
-            images_on_page = doc[pg].get_images(full=True)
-            if not images_on_page:
-                out.append({"page": pg, "xref": "NO_RAS", "w": 0, "h": 0, "text": "<NO_RASTER_IMAGES_FOUND_ON_PAGE>"})
-            
-            for idx, info in enumerate(images_on_page):
+            for idx, info in enumerate(doc[pg].get_images(full=True)):
                 xref = info[0]
                 img_data = doc.extract_image(xref)
                 pil_img = Image.open(io.BytesIO(img_data["image"])).convert("RGB")
-                
-                # We skip if BOTH dimensions are tiny, or if it's a 1-pixel-thin line.
                 if (pil_img.width < 30 and pil_img.height < 30) or pil_img.width <= 2 or pil_img.height <= 2:
                     del pil_img
                     continue
-
-                pil_img = _resize(pil_img, 512)
-                buf = io.BytesIO()
-                pil_img.save(buf, format="JPEG", quality=85)
-                b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-                
-                out.append({
+                if max_side > 0:
+                    pil_img = _resize(pil_img, max_side)
+                metas.append({
                     "page": pg,
                     "img_idx": idx,
                     "xref": xref,
                     "w": pil_img.width,
                     "h": pil_img.height,
-                    "base64": b64_str,
-                    "text": "<DEFERRED_TO_LLM_VISION>"
                 })
+                arrs.append(np.asarray(pil_img, dtype=np.uint8))
                 del pil_img
-                
         doc.close()
     except Exception as e:
-        print(f"[EXTRACT] Embedded image encoding error: {e}")
-        out.append({"page": 0, "xref": "CRASH_LOG", "w": 0, "h": 0, "text": f"SYSTEM_ERROR: {str(e)}"})
+        print(f"[EXTRACT] Embedded image OCR prep error: {e}")
+        return [{"page": 0, "xref": "CRASH_LOG", "w": 0, "h": 0, "text": f"SYSTEM_ERROR: {str(e)}"}]
+
+    if not arrs:
+        return []
+
+    from sanitization.doctr_ocr import run_batch_ocr
+
+    out: list[dict] = []
+    for i in range(0, len(arrs), OCR_CHUNK_SIZE):
+        chunk_metas = metas[i : i + OCR_CHUNK_SIZE]
+        texts = run_batch_ocr(arrs[i : i + OCR_CHUNK_SIZE])
+        for m, t in zip(chunk_metas, texts):
+            row = dict(m)
+            row["text"] = (t or "").strip()
+            out.append(row)
     return out
 
 
 def _resize(img: Image.Image, max_side: int) -> Image.Image:
+    if max_side <= 0:
+        return img
     w, h = img.size
     if max(w, h) <= max_side:
         return img
