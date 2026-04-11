@@ -114,41 +114,35 @@ def extract_pages(
         results: list[dict] = [None] * n_pages
         ocr_needed: list[int] = []
 
-        has_images = [bool(page.get_images(full=True)) for page in doc]
+        native_texts: list[str] = [doc[i].get_text("text").strip() for i in range(n_pages)]
+        has_images = [bool(doc[i].get_images(full=True)) for i in range(n_pages)]
+
+        def should_ocr(page_idx: int) -> bool:
+            return has_images[page_idx] or not native_texts[page_idx]
 
         if EXTRACT_OCR_MODE == "full_page":
             for i in range(n_pages):
-                if has_images[i]:
+                if should_ocr(i):
                     results[i] = {"page": i, "text": "", "method": "ocr"}
                     ocr_needed.append(i)
                 else:
-                    results[i] = {"page": i, "text": doc[i].get_text("text").strip(), "method": "native"}
+                    results[i] = {"page": i, "text": native_texts[i], "method": "native"}
             print(
-                f"[EXTRACT] full_page image-aware: {len(ocr_needed)} pages with images will use OCR, "
-                f"{n_pages - len(ocr_needed)} pages use native text"
+                f"[EXTRACT] full_page image-aware: {len(ocr_needed)} pages OCR, "
+                f"{n_pages - len(ocr_needed)} pages native text"
             )
         else:
             # native_first
-            args = []
             for i in range(n_pages):
-                if has_images[i]:
+                if should_ocr(i):
                     results[i] = {"page": i, "text": "", "method": "ocr"}
                     ocr_needed.append(i)
                 else:
-                    args.append((i, pdf_path))
-
-            if args:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                    for page_idx, text in pool.map(_read_native_page, args):
-                        if len(text) >= MIN_NATIVE_CHARS:
-                            results[page_idx] = {"page": page_idx, "text": text, "method": "native"}
-                        else:
-                            results[page_idx] = {"page": page_idx, "text": "", "method": "ocr"}
-                            ocr_needed.append(page_idx)
+                    results[i] = {"page": i, "text": native_texts[i], "method": "native"}
 
             print(
-                f"[EXTRACT] native_first: {len(args)} image-free pages native-read, "
-                f"{len(ocr_needed)} pages need OCR [{time.perf_counter()-t0:.2f}s]"
+                f"[EXTRACT] native_first: {n_pages - len(ocr_needed)} native text pages, "
+                f"{len(ocr_needed)} OCR pages [{time.perf_counter()-t0:.2f}s]"
             )
 
         if ocr_needed:
