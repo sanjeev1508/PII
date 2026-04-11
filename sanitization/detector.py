@@ -300,6 +300,47 @@ def _detect_page(args):
             "_score": score,
             "_cfg": cfg,
         })
+        
+    # Process explicit embedded images for PII
+    for img in page_data.get("images", []):
+        if img.get("decision") == "MASK":
+            page_candidates.append({
+                "id": f"IMG_{pg}_{img.get('img_idx', 0)}",
+                "page": pg,
+                "type": "IMAGE_PII",
+                "value": "<Visual_PII>",
+                "start": 0, "end": 0,
+                "confidence": 0.99,
+                "mask_template": "[ILLUSTRATION-{id}]",
+                "_score": 0.99,
+                "_cfg": {"category": "high_risk"},
+                "xref": img.get("xref")
+            })
+        img_text = img.get("text", "")
+        if not img_text.strip() or not _PRESCREEN_RE.search(img_text): continue
+        try:
+            res_img = analyzer.analyze(text=img_text, language="en", entities=presidio_types)
+            for r in res_img:
+                entity_type = _from_presidio(r.entity_type)
+                if entity_type not in enabled_types: continue
+                cfg = enabled_types[entity_type]
+                score = float(r.score)
+                if score < (0.30 if entity_type in _HIGH_RISK else llm_min_conf): continue
+                value = img_text[r.start:r.end].strip()
+                if value.lower() in allowlist_sets.get(entity_type, frozenset()): continue
+                if not _validate(entity_type, value, cfg): continue
+                
+                page_candidates.append({
+                    "page": pg, "type": entity_type, "value": value,
+                    "start": r.start, "end": r.end,
+                    "confidence": round(score, 3),
+                    "mask_template": cfg.get("mask_template", f"[{entity_type}-{{id}}]"),
+                    "_score": score,
+                    "_cfg": cfg,
+                    "xref": img.get("xref")
+                })
+        except Exception:
+            pass
 
     return pg, page_candidates, page_review_log
 
@@ -477,16 +518,21 @@ def _validate(entity_type, value, cfg):
 
 
 def _to_presidio(types):
-    m = {"PERSON": "PERSON", "EMAIL_ADDRESS": "EMAIL_ADDRESS", "PHONE_NUMBER": "PHONE_NUMBER",
-         "CREDIT_CARD": "CREDIT_CARD", "US_SSN": "US_SSN", "FINANCIAL_AMOUNT": "FINANCIAL_AMOUNT",
-         "PARTY_NAME": "PARTY_NAME", "ADDRESS": "LOCATION", "JURISDICTION": "JURISDICTION",
-         "DATE_TIME": "DATE_TIME", "IP_ADDRESS": "IP_ADDRESS",
-         "US_PASSPORT": "US_PASSPORT", "US_DRIVER_LICENSE": "US_DRIVER_LICENSE"}
-    return list({m.get(t, t) for t in types})
+    out = set()
+    for t in types:
+        if t == "PARTY_NAME":
+            out.add("ORG")
+            out.add("PARTY_NAME")
+        elif t == "ADDRESS":
+            out.add("LOCATION")
+            out.add("ADDRESS")
+        else:
+            out.add(t)
+    return list(out)
 
 
 def _from_presidio(t):
-    return {"LOCATION": "ADDRESS"}.get(t, t)
+    return {"LOCATION": "ADDRESS", "ORG": "PARTY_NAME"}.get(t, t)
 
 
 def _write_reference(ref_path, acc):

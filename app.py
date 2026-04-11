@@ -29,7 +29,6 @@ load_dotenv()
 
 from sanitization.detector import load_config
 from sanitization.orchestrator import run_pipeline_async
-from sanitization.extractor import prewarm as prewarm_ocr
 
 app = FastAPI(title="PII Sanitizer")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -51,7 +50,6 @@ async def startup():
     from sanitization.detector import prewarm_analyzer
     print("[STARTUP] Loading all models in parallel…")
     await asyncio.gather(
-        asyncio.to_thread(prewarm_ocr),        # blocks until doctr is loaded
         asyncio.to_thread(prewarm_analyzer),   # blocks until Presidio + NER loaded
     )
     _MODELS_READY = True
@@ -130,6 +128,7 @@ async def sanitize(file: UploadFile, background_tasks: BackgroundTasks):
         "input_path": input_path,
         "masked_path": None,
         "report_path": None,
+        "extraction_path": None,
         "report_text": "",
         "status": "running",
         "event_queue": event_queue,
@@ -150,6 +149,7 @@ async def sanitize(file: UploadFile, background_tasks: BackgroundTasks):
             _SESSIONS[session_id].update({
                 "masked_path": ctx.masked_path,
                 "report_path": ctx.report_path,
+                "extraction_path": getattr(ctx, "extraction_path", None),
                 "report_text": _extract_pdf_text(ctx.report_path),
                 "status": "complete",
                 "entity_count": len(ctx.final_entities),
@@ -206,11 +206,13 @@ def serve_pdf(session_id: str, name: str):
         "masked": session.get("masked_path"),
         "report": session.get("report_path"),
         "original": session.get("input_path"),
+        "extraction": session.get("extraction_path"),
     }
     path = paths.get(name)
     if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="PDF not found")
-    return FileResponse(path=path, media_type="application/pdf",
+        raise HTTPException(status_code=404, detail="File not found")
+    media = "text/plain" if name == "extraction" else "application/pdf"
+    return FileResponse(path=path, media_type=media,
                         headers={"Content-Disposition": "inline"})
 
 
@@ -224,11 +226,13 @@ def download_pdf(session_id: str, filename: str):
         "masked.pdf": session.get("masked_path"),
         "report.pdf": session.get("report_path"),
         "original.pdf": session.get("input_path"),
+        "extraction.txt": session.get("extraction_path"),
     }
     path = name_map.get(filename)
     if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="PDF not found")
-    return FileResponse(path=path, media_type="application/pdf", filename=filename,
+        raise HTTPException(status_code=404, detail="File not found")
+    media = "text/plain" if filename.endswith(".txt") else "application/pdf"
+    return FileResponse(path=path, media_type=media, filename=filename,
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 

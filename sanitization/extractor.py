@@ -36,45 +36,10 @@ MAX_WORKERS      = int(os.getenv("EXTRACTOR_WORKERS", "6"))
 OCR_CHUNK_SIZE   = int(os.getenv("OCR_CHUNK_SIZE", "12"))
 # ─────────────────────────────────────────────────────────────────────────────
 
-_predictor_ready = threading.Event()
-
-# Global page-hash → text cache (lives for process lifetime; avoids re-OCR)
-_page_cache: dict[str, str] = {}
-_cache_lock = threading.Lock()
-
-
-@lru_cache(maxsize=1)
-def _get_predictor():
-    """Load lightweight doctr model. Cached — loaded ONCE per process."""
-    from doctr.models import ocr_predictor
-    p = ocr_predictor(
-        det_arch="db_mobilenet_v3_large",
-        reco_arch="crnn_mobilenet_v3_small",
-        pretrained=True,
-        assume_straight_pages=True,   # skip rectification — big speedup
-    )
-    print("[EXTRACT] Doctr predictor ready (db_mobilenet_v3_large + crnn_mobilenet_v3_small)")
-    _predictor_ready.set()
-    return p
-
-
-def prewarm():
-    """
-    BLOCKING prewarm — loads doctr fully before returning.
-    Called by app startup so the first request has zero cold-start delay.
-    """
-    print("[EXTRACT] Loading doctr model (blocking startup prewarm)…")
-    try:
-        _get_predictor()   # lru_cache: loads once, fast on subsequent calls
-        print("[EXTRACT] Doctr model ready.")
-    except Exception as e:
-        print(f"[EXTRACT] Prewarm failed (non-fatal): {e}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _page_hash(pix: fitz.Pixmap) -> str:
-    return hashlib.md5(pix.samples).hexdigest()
 
 
 def _read_native_page(args):
@@ -89,38 +54,6 @@ def _read_native_page(args):
         return page_idx, ""
 
 
-def _render_page_to_jpeg(args):
-    """
-    Worker: render one fitz page → JPEG bytes in memory.
-    JPEG is ~5x smaller than PNG → less disk I/O during batch OCR.
-    Returns (page_idx, jpeg_bytes_or_None, hash, was_cached).
-    """
-    page_idx, pdf_path, dpi, max_side = args
-    try:
-        doc = fitz.open(pdf_path)
-        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-        pix = doc[page_idx].get_pixmap(matrix=mat, alpha=False)
-        h = _page_hash(pix)
-
-        with _cache_lock:
-            if h in _page_cache:
-                doc.close()
-                return page_idx, _page_cache[h], h, True  # cache hit
-
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        img = _resize(img, max_side)
-        doc.close()
-
-        # Save to JPEG bytes in memory — no disk write yet
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85, optimize=False)
-        jpeg_bytes = buf.getvalue()
-        del img, buf  # release RAM immediately
-
-        return page_idx, jpeg_bytes, h, False
-    except Exception as e:
-        print(f"[EXTRACT] Render error page {page_idx}: {e}")
-        return page_idx, None, "", False
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -159,106 +92,12 @@ def extract_pages(
                 ocr_needed.append(page_idx)
 
     native_count = n_pages - len(ocr_needed)
-    print(f"[EXTRACT] {native_count} native, {len(ocr_needed)} OCR  "
-          f"[{time.perf_counter()-t0:.2f}s]")
+    print(f"[EXTRACT] {n_pages} total pages native read [{time.perf_counter()-t0:.2f}s]")
 
-    # ── STEP 2: Chunked OCR (prevents RAM spikes on large docs) ──────────────
-    if ocr_needed:
-        ocr_results = _chunked_ocr(pdf_path, ocr_needed, workers, progress_cb)
-        for pg, text in ocr_results.items():
-            results[pg]["text"] = text
+    if progress_cb:
+        progress_cb(n_pages, n_pages)
 
     print(f"[EXTRACT] Done in {time.perf_counter()-t0:.2f}s")
-    return results
-
-
-# ── Chunked OCR pipeline ──────────────────────────────────────────────────────
-
-def _chunked_ocr(
-    pdf_path: str,
-    page_nums: list[int],
-    workers: int,
-    progress_cb=None,
-) -> dict[int, str]:
-    """
-    Process OCR pages in chunks of OCR_CHUNK_SIZE.
-    - Each chunk: parallel JPEG render → doctr inference → free RAM
-    - Prevents the OOM / 90s hangs seen on large scanned PDFs
-    """
-    predictor = _get_predictor()
-    results: dict[int, str] = {}
-    total = len(page_nums)
-    done = 0
-
-    # Split into chunks
-    chunks = [page_nums[i:i + OCR_CHUNK_SIZE]
-              for i in range(0, total, OCR_CHUNK_SIZE)]
-
-    print(f"[EXTRACT] OCR: {total} pages in {len(chunks)} chunks of ≤{OCR_CHUNK_SIZE}")
-
-    for chunk_idx, chunk in enumerate(chunks):
-        chunk_t = __import__("time").perf_counter()
-
-        render_args = [(pg, pdf_path, OCR_DPI, OCR_MAX_SIDE) for pg in chunk]
-
-        # Parallel JPEG render for this chunk
-        cache_hits: dict[int, str] = {}
-        to_infer: list[tuple[int, bytes, str]] = []  # (page_idx, jpeg_bytes, hash)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            for page_idx, data, h, was_cached in pool.map(_render_page_to_jpeg, render_args):
-                if was_cached:
-                    cache_hits[page_idx] = data
-                elif data is not None:
-                    to_infer.append((page_idx, data, h))
-                else:
-                    cache_hits[page_idx] = ""
-
-        results.update(cache_hits)
-
-        # Doctr inference on this chunk (write JPEG files, infer, clean up)
-        if to_infer:
-            with TemporaryDirectory() as tmp:
-                paths = []
-                meta = []
-                for i, (page_idx, jpeg_bytes, h) in enumerate(to_infer):
-                    p = Path(tmp) / f"p{i}.jpg"
-                    p.write_bytes(jpeg_bytes)
-                    paths.append(str(p))
-                    meta.append((page_idx, h))
-                    del jpeg_bytes  # release memory immediately
-
-                try:
-                    from doctr.io import DocumentFile
-                    ocr_out = predictor(DocumentFile.from_images(paths))
-                    for i, ocr_page in enumerate(ocr_out.pages):
-                        lines = [
-                            " ".join(w.value for w in ln.words if w.value)
-                            for blk in ocr_page.blocks
-                            for ln in blk.lines
-                        ]
-                        text = "\n".join(lines).strip()
-                        page_idx, h = meta[i]
-                        results[page_idx] = text
-                        if h:
-                            with _cache_lock:
-                                _page_cache[h] = text
-                except Exception as e:
-                    print(f"[EXTRACT] OCR chunk {chunk_idx} failed: {e}")
-                    for page_idx, _ in meta:
-                        results[page_idx] = ""
-
-        done += len(chunk)
-        elapsed = __import__("time").perf_counter() - chunk_t
-        print(f"[EXTRACT] Chunk {chunk_idx+1}/{len(chunks)} done  "
-              f"({done}/{total} pages)  [{elapsed:.1f}s]")
-
-        if progress_cb:
-            try:
-                progress_cb(done, total)
-            except Exception:
-                pass
-
     return results
 
 
@@ -285,47 +124,47 @@ def extract_tables(pdf_path: str) -> list[dict]:
 # ── Embedded image OCR ────────────────────────────────────────────────────────
 
 def extract_embedded_images(pdf_path: str) -> list[dict]:
-    """OCR raster images embedded inside the PDF."""
+    """Base64 encode raster images embedded inside the PDF for Vision LLM."""
     out = []
     try:
-        predictor = _get_predictor()
+        import base64
         doc = fitz.open(pdf_path)
-        paths, meta = [], []
 
-        with TemporaryDirectory() as tmp:
-            for pg in range(len(doc)):
-                for idx, info in enumerate(doc[pg].get_images(full=True)):
-                    xref = info[0]
-                    img_data = doc.extract_image(xref)
-                    pil_img = Image.open(io.BytesIO(img_data["image"])).convert("RGB")
-                    
-                    # 10-K and financial PDFs contain hundreds of 1x1 or tiny pixel spacers/lines.
-                    # OCR'ing these creates massive bottlenecks. Skip images smaller than 60x60.
-                    if pil_img.width < 60 or pil_img.height < 60:
-                        del pil_img
-                        continue
-
-                    pil_img = _resize(pil_img, OCR_MAX_SIDE)
-                    p = Path(tmp) / f"img_{pg}_{idx}.jpg"
-                    pil_img.save(p, format="JPEG", quality=85)
+        for pg in range(len(doc)):
+            images_on_page = doc[pg].get_images(full=True)
+            if not images_on_page:
+                out.append({"page": pg, "xref": "NO_RAS", "w": 0, "h": 0, "text": "<NO_RASTER_IMAGES_FOUND_ON_PAGE>"})
+            
+            for idx, info in enumerate(images_on_page):
+                xref = info[0]
+                img_data = doc.extract_image(xref)
+                pil_img = Image.open(io.BytesIO(img_data["image"])).convert("RGB")
+                
+                # We skip if BOTH dimensions are tiny, or if it's a 1-pixel-thin line.
+                if (pil_img.width < 30 and pil_img.height < 30) or pil_img.width <= 2 or pil_img.height <= 2:
                     del pil_img
-                    paths.append(str(p))
-                    meta.append({"page": pg, "img_idx": idx})
+                    continue
 
-            if paths:
-                from doctr.io import DocumentFile
-                ocr_out = predictor(DocumentFile.from_images(paths))
-                for i, ocr_page in enumerate(ocr_out.pages):
-                    lines = [
-                        " ".join(w.value for w in ln.words if w.value)
-                        for blk in ocr_page.blocks for ln in blk.lines
-                    ]
-                    text = "\n".join(lines).strip()
-                    if text:
-                        out.append({**meta[i], "text": text})
+                pil_img = _resize(pil_img, 512)
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=85)
+                b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+                
+                out.append({
+                    "page": pg,
+                    "img_idx": idx,
+                    "xref": xref,
+                    "w": pil_img.width,
+                    "h": pil_img.height,
+                    "base64": b64_str,
+                    "text": "<DEFERRED_TO_LLM_VISION>"
+                })
+                del pil_img
+                
         doc.close()
     except Exception as e:
-        print(f"[EXTRACT] Embedded image OCR error: {e}")
+        print(f"[EXTRACT] Embedded image encoding error: {e}")
+        out.append({"page": 0, "xref": "CRASH_LOG", "w": 0, "h": 0, "text": f"SYSTEM_ERROR: {str(e)}"})
     return out
 
 

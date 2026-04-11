@@ -34,6 +34,23 @@ def mask_pdf(
         page_key = str(page_num)
 
         for ent in page_entities:
+            # ── 1. Image-based redaction (Full bounding box mapping)
+            if "xref" in ent:
+                try:
+                    rects = page.get_image_rects(ent["xref"])
+                    for r in rects:
+                        page.add_redact_annot(r, fill=(0, 0, 0))
+                    manifest.setdefault(page_key, []).append({
+                        "type": ent.get("type"),
+                        "value": ent.get("value"),
+                        "confidence": ent.get("confidence", 0),
+                        "rects": [[r.x0, r.y0, r.x1, r.y1] for r in rects],
+                    })
+                except Exception as e:
+                    print(f"[MASK] Failed to redact image xref {ent['xref']}: {e}")
+                continue
+
+            # ── 2. Standard Text redaction
             value = (ent.get("value") or "").strip()
             if not value:
                 continue

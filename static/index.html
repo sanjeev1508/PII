@@ -251,7 +251,6 @@
       <div id="agent-rows"></div>
     </div>
 
-    <!-- Output PDFs -->
     <div class="s-section" id="output-section">
       <h3>Output Files</h3>
       <div class="pdf-item masked" id="btn-masked" onclick="viewPdf('masked')">
@@ -268,6 +267,11 @@
         <span class="pdf-icon">📄</span>
         <div class="pdf-meta"><div class="pdf-name">original.pdf</div><div class="pdf-sub">Source document</div></div>
         <span class="pdf-badge">ORIGINAL</span>
+      </div>
+      <div class="pdf-item" id="btn-extraction" onclick="window.open(`${API}/download/${currentSession}/extraction.txt`, '_blank')">
+        <span class="pdf-icon">📝</span>
+        <div class="pdf-meta"><div class="pdf-name">extraction.txt</div><div class="pdf-sub">Page-wise OCR log</div></div>
+        <span class="pdf-badge">LOG</span>
       </div>
     </div>
 

@@ -5,7 +5,7 @@ pymupdf
 pdfplumber
 pdf2image
 Pillow
-python-doctr
+
 spacy
 presidio-analyzer
 presidio-anonymizer

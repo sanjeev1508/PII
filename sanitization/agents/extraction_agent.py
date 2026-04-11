@@ -76,9 +76,28 @@ class ExtractionAgent(BaseAgent):
             if pg < len(ctx.pages):
                 ctx.pages[pg]["text"] += f"\n\n[TABLE]\n{table_text}"
 
-        for img in ctx.image_texts:
+        # Step 1.5: Async Vision LLM Classification
+        from sanitization.llm_classifier import vision_classify_image
+
+        async def _classify(img):
+            if "base64" in img:
+                ans = await asyncio.to_thread(vision_classify_image, img["base64"])
+                img["decision"] = ans
+                img.pop("base64", None)  # instantly free base64 payload to preserve RAM
+                img["text"] = f"<VISION ML DECISION: {ans}>"
+            return img
+
+        if image_texts:
+            await ctx.events.put({"type": "progress", "agent": self.name, "msg": f"Running Vision LLM on {len(image_texts)} image(s)..."})
+            classified_images = await asyncio.gather(*[_classify(img) for img in image_texts])
+        else:
+            classified_images = []
+
+        for img in classified_images:
             pg = img.get("page", 0)
-            if img.get("text") and pg < len(ctx.pages):
-                ctx.pages[pg]["text"] += f"\n\n[IMAGE_OCR]\n{img['text']}"
+            if pg < len(ctx.pages):
+                if "images" not in ctx.pages[pg]:
+                    ctx.pages[pg]["images"] = []
+                ctx.pages[pg]["images"].append(img)
 
         return ctx

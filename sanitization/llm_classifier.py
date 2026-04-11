@@ -22,6 +22,38 @@ def _get_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def vision_classify_image(base64_str: str, model: str = "gpt-4o-mini") -> str:
+    """Classify if an image contains PII/logos via Vision LLM."""
+    client = _get_client()
+    prompt = (
+        "You are a strict PII and business intelligence classifier. "
+        "Does this image contain ANY sensitive entities such as personal names, physical addresses, "
+        "or recognizable specific company names and logos? "
+        "If yes, output only YES. Else output NO."
+    )
+    payload = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_str}"}}
+    ]
+    try:
+        if hasattr(client, "responses"):
+            response = client.responses.create(
+                model=model, max_output_tokens=10, temperature=0,
+                input=payload
+            )
+            ans = (getattr(response, "output_text", "") or "").strip().upper()
+        else:
+            response = client.chat.completions.create(
+                model=model, max_tokens=10, temperature=0,
+                messages=[{"role": "user", "content": payload}]
+            )
+            ans = (response.choices[0].message.content or "").strip().upper()
+        return "MASK" if "YES" in ans else "KEEP"
+    except Exception as e:
+        print(f"[VISION] classification error: {e}")
+        return "ERROR"
+
+
 def _llm_is_sensitive_local(
     *,
     entity_type: str,

@@ -41,6 +41,22 @@ class ReportingAgent(BaseAgent):
             for r in ctx.agent_review_rows
         ]
 
+        # Generate a page-wise extraction log for user verification
+        extraction_path = os.path.join(ctx.work_dir, "extraction.txt")
+        with open(extraction_path, "w", encoding="utf-8") as f:
+            f.write("=== PAGE-WISE EXTRACTION VERIFICATION LOG ===\n\n")
+            for page in ctx.pages:
+                pg_idx = page.get("page", 0)
+                method = page.get("method", "unknown")
+                text = page.get("text", "")
+                f.write(f"--- PAGE {pg_idx + 1} [{method.upper()}] ---\n")
+                f.write(text.strip() + "\n\n")
+                # Include explicit image metadata if available
+                for img in page.get("images", []):
+                    img_text = img.get("text", "").strip()
+                    f.write(f"[EMBEDDED IMAGE - xref {img.get('xref')} | dimensions {img.get('w', '?')}x{img.get('h', '?')}]\n")
+                    f.write(f"{img_text if img_text else '<EMPTY_OCR>'}\n\n")
+
         await asyncio.to_thread(
             generate_report,
             output_path=report_path,
@@ -55,5 +71,6 @@ class ReportingAgent(BaseAgent):
             agent_review_rows=ctx.agent_review_rows,
         )
         ctx.report_path = report_path
+        ctx.extraction_path = extraction_path
         await ctx.events.put({"type": "progress", "agent": self.name, "msg": "Report ready"})
         return ctx
